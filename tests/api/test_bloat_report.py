@@ -91,8 +91,10 @@ def test_bloat_uses_the_reader_pinned_nonpruning_horizon(
             def pruning_horizon_forbidden(_coordinator: object) -> None:
                 raise AssertionError("a read-only bloat census must not prune reader records")
 
+            coordinator_type = type(database._transactions._coordinator)
+            original_reader_horizon = coordinator_type.reader_horizon
             monkeypatch.setattr(
-                type(database._transactions._coordinator),
+                coordinator_type,
                 "reader_horizon",
                 pruning_horizon_forbidden,
             )
@@ -111,6 +113,20 @@ def test_bloat_uses_the_reader_pinned_nonpruning_horizon(
             assert report.horizon_retained_slot_bytes > 0
         finally:
             old_reader.rollback()
+            monkeypatch.setattr(coordinator_type, "reader_horizon", original_reader_horizon)
+
+        # The prior checkpoint was capped by the reader. Advance that separate,
+        # explicitly mutating lifecycle step after releasing the snapshot.
+        database.checkpoint()
+        # Asking for a census changes neither the new horizon nor storage bytes.
+        after_close_image = _device_image(database)
+        released = database.maintenance.bloat("P")
+        assert released.recyclable_horizon_lsn > report.recyclable_horizon_lsn
+        assert released.ended_versions == report.ended_versions == 1
+        assert released.horizon_eligible_versions == 1
+        assert released.horizon_retained_versions == 0
+        assert released.vacuum_safety_established is False
+        assert _device_image(database) == after_close_image
 
 
 def test_bloat_reads_headers_without_decoding_payload_or_following_overflow(

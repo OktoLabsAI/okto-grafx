@@ -101,8 +101,7 @@ def test_graph_exchange_recipes():
         exec(compile(code, "graph exchange documentation", "exec"), scope)
 
 
-@pytest.mark.optional_dependency("polars")
-@pytest.mark.optional_dependency("pyarrow")
+@pytest.mark.optional_dependency("polars", "pyarrow")
 def test_polars_recipe():
     pytest.importorskip("polars")
     pytest.importorskip("pyarrow")

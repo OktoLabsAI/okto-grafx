@@ -12,6 +12,7 @@ from okto_grafx.engine.index_manager import HashIndex, IndexStore, INDEX_READ_RE
 from okto_grafx.errors import GrafxCorruptionDetected, GrafxError, GrafxIndexError
 
 from . import test_vector_free_traversal as vector_fixture
+from .work_statistics import comparable_statistics
 
 graph = vector_fixture.graph
 SCAN_PREFIX = vector_fixture.SCAN_PREFIX
@@ -24,14 +25,19 @@ def _identity(graph, table="B"):
 
 
 @pytest.mark.parametrize("expression", ["count(r)", "count(*)", "count(r) AS c"])
-def test_count_matches_scalar_rows_columns_and_statistics(graph, monkeypatch, expression):
+def test_count_matches_scalar_rows_columns_and_comparable_statistics(graph, monkeypatch, expression):
     query = SCAN_PREFIX + "RETURN " + expression
     candidate = graph.execute(query)
     monkeypatch.setattr(qe, "_batched_relationship_count", lambda *_args: None)
     oracle = graph.execute(query)
     assert candidate.rows == oracle.rows == ((6,),)
     assert candidate.columns == oracle.columns
-    assert candidate.statistics == oracle.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(oracle.statistics)
+    # The batch deliberately spends fewer certificates and reports grouped
+    # physical work; those diagnostics describe the chosen access regime.
+    assert candidate.statistics["landing_batches"] > 0
+    assert "landing_batches" not in oracle.statistics
+    assert candidate.statistics["certificate_attempts"] < oracle.statistics["certificate_attempts"]
 
 
 def test_frontier_never_exceeds_64_and_opens_fewer_certificates(graph, monkeypatch):

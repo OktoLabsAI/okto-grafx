@@ -1,13 +1,306 @@
 # Current performance and measurement boundaries
 
+## RF01–RF12 implementation evidence
+
+The current development branch includes the RF01–RF12 mechanisms and recipes
+summarized in the [roadmap](../ROADMAP.md#grafx-performance-rf01rf12-october-23-2026).
+Their qualification establishes exact results, bounded logical-memory and
+quota behavior, streaming demand, durable ACK/reopen, rollback and structural
+physical-work observations on the selected workloads. RF11 full-text proofs
+also check ranking and statistics-source behavior. These checks do not certify
+an elapsed-time improvement, a universal throughput ratio or RF01 total
+instrumentation overhead. Earlier calibrated timing runs were inconclusive
+under host load. The timed campaign protocols below remain available when a
+temporal claim is needed; no default or storage maintenance policy follows
+from the structural evidence alone.
+
+## RF10 reading recipes: choose the snapshot contract
+
+| Application need | Recipe | Visibility and lifetime |
+| --- | --- | --- |
+| Several reads compose one business result | `with db.begin("read") as tx`, then `tx.execute(...)` | One fixed snapshot; later commits are not refreshed between statements. |
+| Independent operations need a newly published view | Separate `db.execute(...)` calls | Each new transaction selects its own view; the group is not one atomic read. |
+| Large incremental result | `with db.query(...).cursor(...) as rows` | Cursor owns its snapshot until exhaustion or close. Close before waiting for network/user input. |
+| Stable keyset export | Pages inside one explicit read transaction | Stable membership at that snapshot; history is retained for the entire export. |
+| Independent keyset pages | New read transaction for each page | Concurrent changes can affect membership; pages do not form one snapshot. |
+
+### Sixteen primary-key reads
+
+Given an existing `Item(id INT64, value INT64, PRIMARY KEY(id))` table and an
+open `db`, these recipes explicitly choose their consistency contract:
+
+```python
+query = "MATCH (n:Item {id: $id}) RETURN n.value"
+keys = range(16)
+with db.begin("read") as tx:
+    related = [tx.execute(query, {"id": key}).rows for key in keys]
+
+independent = [db.execute(query, {"id": key}).rows for key in keys]
+```
+
+The first group uses one snapshot and transaction boundary; the second opens
+sixteen independent transactions. An external writer between related reads is
+visible only after a new transaction starts. Equality on an unchanged fixture
+does not make the concurrent semantics interchangeable. Grouping can amortize
+transaction work when shared consistency is required; no universal speedup is
+promised. Deterministic tests count successful opens and settlements (1 versus
+16). These counts do not establish a latency comparison.
+
+### Keyset pages and ownership
+
+Use a unique, stable ordering key. For the same table:
+
+```python
+page_query = (
+    "MATCH (n:Item) WHERE n.id > $after "
+    "RETURN n.id ORDER BY n.id LIMIT 4"
+)
+all_ids = []
+with db.begin("read") as tx:
+    after = -1  # This fixture uses nonnegative IDs.
+    while page := tx.execute(page_query, {"after": after}).rows:
+        all_ids.extend(row[0] for row in page)
+        after = page[-1][0]
+```
+
+For independent pages, omit the outer transaction and call `db.execute` inside
+the loop. A concurrent delete can remove an unseen row; an insert ahead of the
+continuation can add one. Changing sort keys can skip or repeat business entities.
+A single snapshot avoids these cross-page changes but holds history longer.
+This recipe does not prove an indexed seek plan or the RF05 optimization.
+`db.query(...).cursor()` owns its own snapshot; do not transfer it into another TX.
+
+```python
+materialized = db.execute("MATCH (n:Item) RETURN n.id")
+with db.query("MATCH (n:Item) RETURN n.id").cursor(batch_size=1) as rows:
+    first = rows.fetchone()  # The block closes even after partial consumption.
+# Explicit rows.close() is also supported and idempotent.
+```
+
+Materialized rows remain detached after their transaction and handle close.
+Keep the handle open while consuming a cursor. Consumer exceptions and query
+cancellation leave through the context manager; cleanup preserves the primary
+error even when cleanup itself fails. See
+[snapshot diagnosis](OPERATIONS.md#read-snapshot-lifetime-and-diagnosis).
+
+Executable coverage: [RF10 recipes](../tests/api/test_read_snapshot_recipes.py),
+[cursor lifecycle](../tests/query/test_query_cursor.py), and
+[reader registration](../tests/txn/test_reader_lifecycle.py). These establish
+consistency and cleanup, not temporal qualification.
+
+The RF10 campaign has eight slices: four read recipes with warm and reopened
+handles. Use a positive, common query-memory budget in both source arms.
+The sixteen-statement recipes use the sequence logical-memory observer, which
+tracks the simultaneous retained tariff across the complete group; the single
+statement recipes use the ordinary observer. First-row timing belongs to the
+measured read. Transaction counts, partial-cursor closure, standing pins and
+handle closure come from a separate untimed diagnostic and are required in
+every qualified sample. Compare each recipe only with itself across revisions;
+the snapshot contracts above remain distinct.
+
+## Ingestion atomicity and cost
+
+Choose the application atomic unit before choosing a faster ingestion shape.
+These recipes use existing public APIs; they introduce no automatic chunking or
+retry helper. All writes below require an explicit write transaction.
+
+| Shape | Atomic boundary and failure | Consumption/cost boundary |
+| --- | --- | --- |
+| Repeated `txn.execute(text, params)` | Each successful statement remains staged; an escaping exception rolls the transaction back. Catching an error is not permission to assume all previous statements were undone. | Repeated statement execution; one durable acknowledgement only when the enclosing write transaction commits. |
+| `txn.executemany(text, iterable)` | One call rolls back its own successful prefix on failure, preserving work staged before that call. It does not commit. An error escaping the transaction block rolls back the whole transaction. | Lazy parameter consumption, no result rows, one parsed statement reused. Iterator side effects cannot be rolled back. |
+| `UNWIND $ids AS id CREATE (:Item {id: id})` | One statement inside a transaction; success is still staged until commit. A transaction failure does not make any prefix durable. | A collection parameter, not a lazy `executemany` iterator; consider parameter size and logical/transaction budgets. |
+| Several transactions containing chunks | Each acknowledged chunk is independently durable. A later failure leaves the earlier committed prefix. | More commits/ACKs; bounded per-transaction work. Use only when partial progress is acceptable and recorded by the application. |
+
+Given an existing `Item(id INT64, PRIMARY KEY(id))` table, an atomic lazy batch is:
+
+```python
+txn = db.begin("write")
+try:
+    with txn:
+        txn.executemany("CREATE (:Item {id: $id})", ({"id": i} for i in range(100)))
+finally:
+    if txn.active:
+        txn.rollback()  # also retire a refused commit at context exit
+report = txn.report  # commit occurred at successful context exit
+```
+
+Do not split this transaction to fit a limit if all 100 rows must commit together.
+Handle a refused commit with the [outcome and cleanup policy](OPERATIONS.md#commit-outcomes-and-retries).
+To accept partial progress explicitly instead:
+
+```python
+acknowledged = []
+for chunk_id, ids in enumerate(((0, 1), (2, 3))):
+    txn = db.begin("write")
+    try:
+        with txn:
+            txn.executemany("CREATE (:Item {id: $id})", ({"id": i} for i in ids))
+    finally:
+        if txn.active:
+            txn.rollback()
+    acknowledged.append((chunk_id, txn.report.csn))
+```
+
+The in-memory `acknowledged` list is illustrative, not a crash-safe resume ledger.
+An exception after a durable barrier can precede that append: reconcile using the
+commit report/durable state and application idempotency before replay. Close owned
+cursors and retire any active refused transaction before retry/backoff; do not
+swallow data/type/budget errors or blindly retry an iterator that has been consumed.
+For `UNWIND`, use `txn.execute("UNWIND $ids AS id CREATE (:Item {id: id})",
+{"ids": [0, 1]})` inside the same explicit transaction. Business recomputation on a
+fresh snapshot is distinct from reusing a literal parameter batch.
+
+Compare equal atomic contracts: report rows attempted/committed, transactions,
+durable write ACKs, conflicts/retries and latency per atomic unit alongside
+rows/second. State chunk size, limits, storage durability and writer count (1/2/4).
+One ACK per row and one ACK per thousand rows have different failure contracts;
+their throughput alone cannot establish an engine improvement. These recipes and
+deterministic tests make no temporal qualification claim.
+
+The RF09 campaign report groups recipes only when row count, payload size and
+writer count match. Its `matched_write_loads` table shows each shape's atomic
+unit and per-pair throughput, durable ACK count and observed commit-call latency;
+it does not calculate a cross-shape speedup. Each `write_tradeoff` retains the
+individual ACK durations with writer, offset and row count. Allocated WAL/file
+byte deltas and runtime physical counters belong to the whole sample. Values
+divided by the ACK count are labelled amortized costs, not bytes or latency
+attributable to an individual commit. Missing physical counters are reported as
+unavailable; logical `rows_created` is listed separately from physical work.
+
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 14, 2026. “Current” means the **latest recorded observation for
+Updated October 21, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
 Current development source is 0.0.7; published baseline is 0.0.6.
 The latest isolated installed Pulse/native observations below use the final
 0.0.6 candidate. The latest production spec-consolidation measurement still uses
 `0.0.4@fa8f188`; no production spec was consolidated for these tests.
+
+## RF01 physical scan statistics (development)
+
+RF01 adds integer diagnostics to `QueryResult.statistics` and cursor statistics.
+`physical_node_versions_examined` and `physical_edge_versions_examined` count
+a stored version header actually examined by an instrumented heap read,
+before snapshot visibility and owner-overlay filtering. Ended or otherwise
+invisible versions count; pending inserts that have not reached the heap do not.
+Repeated scans count their repeated work. Existing `rows_scanned`, `edge_scans`
+and cooperative cancellation/quota checkpoints retain their meanings.
+
+Coverage includes canonical node scans (full and projected), grouped traversal
+and relationship scans, index candidate reads, identity landings, visible-record
+cursors and `scan_page`. An absent counter means no instrumented operation
+reported that unit; it does not prove zero work through a custom collaborator.
+An executed empty scan, or the existing proven pageless relationship shortcut,
+reports zero. Custom ports retain their behavior; results returned by a custom
+port are never counted as a substitute for observing its physical work.
+
+| Counter | Unit |
+| --- | --- |
+| `index_probe_keys` | Distinct keys actually sent to a physical bucket lookup, counted again when retried |
+| `certificate_attempts` | Exact-read certificate attempts actually started |
+| `certificate_retries` | Additional attempts actually started after a refusal |
+| `landing_candidates` | Physical candidates submitted to identity validation, including invisible candidates and retries |
+| `landing_batches` | Identity groups submitted through a grouped validation door; a cache-only reuse does not add a batch |
+
+Result multiplicity does not multiply a reused physical read. A certificate
+retry counts its discarded work and is not itself a fallback. The first guard
+that actually selects a consumed alternative sets one integer diagnostic
+`fallback_reason_<reason>=1`. The closed reasons are `ineligible_shape`,
+`unproven_binding`, `unproven_totality`, `nonselective_probe_set`, `fan_limit`,
+`index_unavailable`, `index_stale`, `owner_overlay`, `noncanonical_port`,
+`quota_frontier`, `memory_guard` and `streaming_guard`. No such key means `none`
+for the instrumented execution. Planning an alternative alone does not set a
+reason; `unproven_binding` is reserved and is not inferred from a scan plan.
+The integer representation preserves the public statistics value contract.
+
+The canonical walk inspects a page's headers before yielding its rows. Early
+close therefore includes the headers already inspected on that page, while
+later pages remain unvisited. Counts accumulate locally and publish after each
+page pin is released. Observation is bound to one execution or cursor pull and
+revoked before returning control to the consumer. Interleaved cursors retain
+separate dictionaries, and nested native procedure statements contribute to
+their parent statement. Counts cover evaluation and referential checks; they
+do not include a later transaction commit. Metrics publication occurs outside
+the cursor observation scope. These diagnostics do not extend the frozen
+`MetricsSink` catalogue; no data, query text or parameters become labels.
+
+RF01's counters and lifecycle have deterministic structural and functional
+qualification. The versioned campaign and report validator are implemented;
+real six-process runs validated the artifact contract, while a conclusive
+three-pair overhead comparison has not been obtained. The counters establish
+measurement semantics, not a speedup or compliance with the overhead budget.
+
+### RF01 campaign evidence and memory boundary
+
+The development campaign under `bench/harness/campaign.py` records six separate
+process runs in AB/BA/AB order, with five warm-ups and twenty retained samples
+per selected scenario and process. Its versioned raw JSON keeps source revisions,
+import provenance, environment and configuration, seed, query and parameter
+hashes, typed result hashes, actual statistics, timing boundaries, cache state,
+WAL and disk deltas, and the measured plan. The independent fixture oracle must
+match every sample before ratios are computed. The report gives per-pair median
+and descriptive p95 ratios; it is not a production percentile or SLA estimate.
+The selected scenario list is part of the evidence; unselected dimensions are
+not implicitly covered.
+
+`python -m bench.harness.campaign calibrate --output <new-file.json>` produces
+an unsigned local executor receipt before a qualification run. It records five
+warm-ups, twenty retained fixed CPU controls, five host CPU observations,
+environment, timestamps, the producing command and hashes of the harness
+sources. `run --calibration <file>` embeds and validates that receipt. Its fixed
+hash workload checks repeatability and host load; it is not a disk or Grafx
+throughput calibration. A boolean calibration claim alone cannot produce a
+qualifying verdict. Invalid supplied receipts are rejected and a noisy or old
+receipt leaves the comparison inconclusive.
+
+The opt-in memory observer reports the peak *simultaneous admitted logical
+tariffs* of query budgets plus retained owner and endpoint handle budgets.
+It does not measure Python allocations, unbudgeted operators, result rows,
+buffer frames or process RSS. RSS is recorded separately as a process-lifetime
+peak. An observation requires a configured query-memory budget, one statement
+and a private handle whose cursor is fully consumed or closed within the
+interval. A missing observer, overlapping statement, foreign execution or
+incomplete cursor makes logical memory unavailable. Sequential operator peaks
+are never summed. This private measurement door changes neither quota admission
+nor the public `MetricsSink` catalogue.
+
+Native full-text search in this fixture verifies membership of sorted record
+IDs, not ranking or scores. Its native memory is outside the query-budget
+observer. Concurrent writer peaks are individual process measurements, never
+added into a fictional shared RSS peak. A qualification attempt must report
+unavailable coverage explicitly instead of substituting zero. Reopen after a
+durable write ACK checks the stored result but does not claim a cleared OS cache.
+
+The first real run of the new harness used `b18e8f1` on both arms, selected only
+the constant control, and validated six clean process outputs in AB/BA/AB order
+with 150 raw samples. It is exploratory: host CPU reached 59%, calibration did
+not meet the registered noise policy, and query memory was unavailable because
+that run omitted the budget. Its purpose was to test orchestration, provenance
+and the raw schema, not counter overhead.
+
+A second complete run compared clean control `4d9c02e` (derived from `3a2239`
+with the same real logical-memory observer, without RF01 physical counters)
+against candidate `b18e8f1`, with the same 64 MiB query budget on both arms.
+All 150 samples validated with matching typed results and available logical
+memory coverage. Candidate/base median ratios across pairs were 1.060, 1.178
+and 1.192; descriptive p95 ratios were 1.011, 1.023 and 1.104. Host CPU reached
+91.5%, and within-process dispersion exceeded the registered limit. The verdict
+is **inconclusive**, irrespective of individual ratios. This control tests the
+incremental counter cost over a common observer, not the observer's own cost
+against the historical source.
+
+The earlier pre-harness counter-overhead comparison also kept identical results
+and raw samples under high, varying host load; its result remains inconclusive.
+Its preregistered repeat stopped at a five-minute readiness gate without starting
+either arm (minimum host CPU 28.2%). None of these runs proves the RF01 overhead
+limit or a speedup. A complete overhead claim must account for the observer's
+cost as well as the counters, under the fixed three-pair protocol and a calibrated
+executor. Artifacts for the new runs are retained locally under
+`.grafx-tmp/rf01-smoke-b18/` and `.grafx-tmp/rf01-control-comparison-1/`;
+their `campaign.json` SHA-256 digests are respectively
+`fa699b373dc5f3157b99c497bd8f304caeef281b4b5893135cee58eebe2ce8bd` and
+`4bf11896a5f5552c7f19446f0d93e5e43fb9576b727e501e88cf524cfaddc420`.
+They contain synthetic fixtures and all raw samples, but are not release evidence.
 
 ## 0.0.7 performance round closure
 
@@ -492,6 +785,107 @@ and rigs. Do not run production-copy or long concurrency harnesses blindly from
 a documentation example. Detailed [reports](reports/README.md) preserve their
 commands/conditions; artifact paths outside the repository may be unavailable.
 
+## RF04 endpoint qualification with RF03 interaction
+
+The structural four-arm interaction proof is available independently of the
+calibrated timing protocol described here. The protocol is needed for any
+future latency claim; its thresholds do not turn structural results into a
+measured speedup.
+
+The RF04 recipe uses the existing connected N/B/E fixture: 1,024 starts, 128
+destinations and 1,151 weighted edges. The selective target has 16 distinct
+keys. A second fixture puts at least 80% of edges on 1% of starts; controls
+exercise 65 starts (the fan-limit is 64) and 1,024 probes against 16 starts
+(actual nonselective node-scan fallback). The oracle derives every ordered row
+and parallel-edge occurrence from fixture input, independently of Grafx.
+
+Four **clean, committed** source revisions are needed on one RF01-instrumented
+foundation: base, RF03 only, RF04 only, and both. The source isolation is a
+separate code-diff/receipt claim; the campaign report checks revision lineage
+and never infers patch content from commit hashes. Run four calibrated,
+three-pair A/B campaigns with a common positive logical-memory budget:
+
+| Campaign | A -> B | Query profile | Target physical counter |
+| --- | --- | --- | --- |
+| `rf03` | base -> RF03 only | Original connected `IN` | Node versions examined |
+| `rf04` | base -> RF04 only | `IN` + `WITH` + connected traversal | Edge versions examined |
+| `incremental` | RF03 only -> both | Original connected `IN` | Edge versions examined |
+| `combined` | base -> both | Original connected `IN` | Edge versions examined |
+
+Select all four named cases of the profile in each campaign:
+`rf04-{original|with}-{target|fan_limit|hub|fallback}`. Use
+`python -m bench.harness.campaign run --mode optimization --intent qualification`
+with `--scenario` repeated for each case, `--baseline`, `--candidate`,
+`--output`, `--calibrated-executor`, `--calibration`, `--memory-budget` and the
+same `--max-cpu-percent` on all runs. For `rf03`, override only the target with
+`--target rf04-original-target:physical_node_versions_examined`; the other
+targets already select physical edge work. Join the four `campaign.json` files
+with `python -m bench.harness.campaign rf04-report --rf03 FILE --rf04 FILE
+--incremental FILE --combined FILE --output NEW_FILE`.
+
+The join rejects a missing control, changed fixture/query/budget, changed
+executor environment or CPU policy, incomplete A/B, missing physical counters,
+semantic divergence, and incorrect source-arm lineage. RF04 candidate targets
+must plan the conditional seek and actually issue 16 endpoint lookups with no
+global edge scan. `EXPLAIN` may include an unexecuted NodeScan alternative;
+runtime `edge_scans`, `edge_lookups`, fallback reasons and physical version
+counters decide which path ran. Each sample retains process CPU time, host CPU
+observations, logical peak with its observer coverage, and process-lifetime RSS
+peak. RSS is not a query allocation. The report includes raw campaign hashes,
+per-pair distributions and controls; qualification requires the target's
+physical work to fall, target median ratio <=0.90 in every pair, and each
+control's median <=1.05 and p95 <=1.10. Noise makes a result inconclusive, with
+at most one complete rerun under the existing campaign protocol. No effects
+from separate phases are added together as a speedup.
+
+## RF07 streaming landing demand
+
+Open streaming traversals retain scalar destination validation. A known `LIMIT`
+does not authorize certifying a larger destination window: a later destination
+may fail after the last row the caller needs. Catching and delaying that error
+does not undo the reads, checks or observed generation. A published prefix must
+never be replayed when a subsequent certificate cannot be stabilized.
+
+This is a negative feasibility result, with no streaming acceleration candidate
+or gain benchmark. Existing closed blocking consumers retain their bounded
+batches where the proof permits them. Adding `ORDER BY` changes the consumer
+and does not demonstrate an improvement to streaming. Reopening the research
+requires a proved speculative-read contract without observable effects, or an
+explicit consumer demand/failure contract. RF07 introduces neither.
+
+The [protection tests](../tests/query/test_streaming_landing_guard.py) and
+[standalone unittest entry points](../tests/query/test_streaming_landing_evidence.py)
+use one source, three destinations and two parallel edges per destination.
+Faults are injected at real heap and certificate doors, preserving the canonical
+port fences so the control can still reach the existing batch implementation.
+These protect an existing correct guard; they do not claim to fix a new defect.
+
+| Case | Demand and permitted destination work | Error and cleanup | Unittest method on `StreamingLandingEvidence` |
+| --- | --- | --- | --- |
+| LIMIT 0 | No destination validation | No destination fault; transaction/cache released | `test_demand_prefix` |
+| LIMIT 1 | First valid destination only | Later corruption or duplicate identity remains unobserved until demanded | `test_demand_prefix` |
+| Partial close | One row with iterator `batch_size=1` | Idempotent close; no further validation; cursor/buffer/transaction/cache released | `test_demand_prefix` |
+| Filter / DISTINCT | Consume until one accepted/distinct result, preserving parallel-edge processing | Later destination fault unobserved; transaction/cache released | `test_demand_prefix` |
+| Cancellation / deadline between pulls | No destination validation after control expires | Control error precedes later fault; cursor/buffer/transaction/cache released | `test_controls_cleanup_and_blocking` |
+| Generation rejection after published prefix | Bounded retries of the subsequent certificate only | `index_view_changed`, no prefix replay; cursor/buffer/transaction/cache released | `test_generation_failure_no_replay` |
+
+The demand test also forces unsafe batch admission in its isolated test process:
+`LIMIT 1` then observes the later corruption before returning its required row.
+The compatibility test checks the retained blocking batch: three distinct keys,
+six relationships and exact grouped results. No test relaxes CRC, MVCC or
+certificate validation to obtain a result.
+
+Demand follows the existing API: iteration may request its configured batch
+size, while `fetchone()` requests one row. Early close does not undo work for
+rows already requested in a batch. These tests do not promise that the default
+iterator batch validates only one row.
+
+The unittest file requires no pytest installation. It imports Grafx from the
+`src` directory adjacent to the tested repository snapshot and refuses an
+already imported Grafx package from elsewhere. Each named method can run
+against a committed source revision. Local runs prove the stated assertions;
+the resulting tests do not establish a streaming speedup.
+
 ## Performance policy
 
 Timings, D5 ratios and former throughput floors are **informational**, not release
@@ -511,3 +905,217 @@ unchanged.
 Grafx does not currently claim Ladybug parity, constant-time general traversal,
 linear CPU/GIL scaling or an RSS bound equal to `buffer_budget_bytes`. Historical
 cross-platform comparisons remain [historical](reports/PERFORMANCE_HISTORY.md).
+
+## RF12 capacity decision protocol
+
+The [operational runbook](OPERATIONS.md#capacity-retention-and-maintenance-runbook)
+defines the four candidate areas: memory, implicit-ID leases, HASH-key skew and
+checkpoint cadence. They are hypotheses for a particular workload, not global
+performance gains. Record a separate decision for each one:
+
+1. Pin source revision, database format, configuration, data/seed, concurrency,
+   transaction and cursor ownership, warmup, machine load and measurement window.
+   Keep the existing setting as control; vary one setting or index action at a
+   time on equivalent disposable copies.
+2. Collect raw per-run throughput/latency and tails alongside process RSS, logical
+   query peaks, page-pool budget, WAL/checkpoint lag, file growth and reader age
+   where applicable. Label absent observers as unavailable. Never convert a
+   logical tariff, record-slot estimate or configured budget into RSS.
+3. Prove exact result and ID semantics, fresh and retained snapshot visibility,
+   rollback/commit outcomes, recovery and external-participant adoption on both
+   arms. For checkpoint experiments, include a foreign writer's committed files
+   and a later reader's visibility across the checkpoint barrier. For a bloat
+   experiment, show the pinned report, reader close, separate checkpoint and
+   post-checkpoint report without treating the census as mutation.
+4. State the benefit and cost with variance and confounders, then choose
+   **maintain**, **local adjustment**, or **new investigation/spec**. If a
+   correctness check fails or the campaign cannot distinguish the arms, keep the
+   current setting. Do not silently change a project default or activate a
+   one-way storage capability from this diagnostic exercise.
+
+The proof for a proposed adjustment must belong to that adjustment. A faster
+lookup sample does not qualify an ID lease, a lower bloat estimate does not
+authorize vacuum, and a shorter checkpoint lag does not establish foreign-writer
+visibility. The runbook and existing `test_bloat_report.py` cover the read-only
+horizon distinction; fixture-level paired campaigns and explicit decision records
+are tracked separately from this documentation change.
+
+The RF12 external-writer matrix includes a 64-lease/32-row reference, equal-work
+controls that vary only the lease, batch-load slices at lease 64, and mixed
+lease/batch interaction slices. Changing batch also changes the number of rows
+in this fixture, so those cuts describe load scaling rather than a causal
+setting benefit. Attribute a local lease effect only through an equal-work
+pair. Four additional external-writer slices keep the same 512 records and
+lease 64, varying only durable transaction size (1, 32, 128 or 512 records).
+Their returned ACKs, offsets, row counts, commit-call times and full write
+interval are kept separately from read latency; the complete 512-row result
+is checked after a read-only reopen. Those equal-work slices can support a
+local transaction-size decision. Interaction slices cannot by themselves
+qualify an adjustment. The timed interval covers only the read;
+update, checkpoint and bloat census costs remain separate diagnostics.
+
+## RF11 full-text statistics matrix
+
+Use the [FTS source-selection recipe](FULL_TEXT_SEARCH.md#choosing-and-checking-a-statistics-source)
+to select an index declaration for a particular corpus. The existing `wal` mode
+is the control; `durable` is opt-in and activates its already defined capability.
+Do not modify a mode in place or infer a new default from a synthetic sample.
+
+| Workload cut | Required comparison | Main benefit/cost question |
+| --- | --- | --- |
+| First search on a newly opened handle, then repeated search in one snapshot | `wal` versus `durable`; record `snapshot_cache`, `wal_delta`, `durable_summary` or `full_census` actually observed | Does a proved summary remove census work when the local snapshot cache is cold? |
+| Read-only reopen after complete write and checkpoint | Same query, dataset and result oracle; separate process-local cache from OS file cache | Is cold/reopen read cost worth summary maintenance and format compatibility? |
+| Reader retained across updates, with history capacities 0, 8 and 32 where page size accepts each | Covered and uncovered snapshots, including marker eviction | Does bounded historical coverage justify larger page-0 records and affected-commit copies? |
+| Insert/update/delete and concurrent writer controls | One complete durable ACK per atomic unit, replay/reopen, exact scores and corpus | How much write latency, WAL, verification and storage cost moves to maintain the summary? |
+
+For each arm retain source revision, format/capabilities, index declaration, seed,
+document/term distribution, query and reader snapshot, cache state, all raw timing
+samples, `statistics_regime`, `statistics_wal_records`, `postings_visited`,
+`candidates`, `corpus_documents`, hit IDs/scores/order and the exact census oracle.
+Include process RSS and logical-memory measures where available, marking absent
+observers unavailable. Report write ACKs, WAL bytes, disk growth and verification
+separately from read latency. A `full_census` result can be correct; only a
+covered summary may claim census avoidance. Corrupt summary metadata must refuse
+rather than masquerade as a fallback. Keep timing in the calibrated campaign;
+the deterministic CI oracles in `test_fulltext_durable.py` and
+`test_fulltext_history.py` establish semantics and recovery, not a speedup.
+
+The maintained `fts-matrix-*` slices in `bench/harness/fts_qualification.py`
+separate a newly opened handle from a primed handle, a WAL delta after one
+committed update, and a reader pinned across four commits. The input-derived
+oracle checks every returned ID, exact BM25 score, tie order and corpus size.
+The campaign requires the expected `full_census`, `snapshot_cache`,
+`wal_delta` or `durable_summary` source for each slice; merely recording a
+source does not count as proving summary coverage. The native FTS path has no
+Cypher query-budget logical-memory observation: its peak remains null with an
+explicit reason, while process RSS is reported separately. This limits a
+recipe comparison to a workload tradeoff, not a comparative logical-memory
+claim.
+
+The raw samples keep setup duration and allocated database/WAL file sizes.
+For slices without updates, a worker builds one fixture and reuses it across
+the 25 search samples; setup therefore has one independent observation per
+process/arm/pair, three per arm across the campaign. Update and write-cost
+slices build one fixture per sample and have 20 retained setup observations
+per process/arm/pair. The report counts fixture observation IDs, not repeated
+references in read samples, and omits a setup p95 when fewer than 20 independent
+fixtures were observed. Setup remains a combined seed/index/checkpoint/close
+cost, never an isolated commit or index-maintenance measurement.
+For update slices they keep each durable commit ACK duration, total update
+duration and signed allocated-byte deltas outside search timing. Allocated WAL
+file growth is not logical bytes appended or a count of fsync operations;
+setup includes seed insertion, index creation and checkpoint, so it cannot
+isolate index-maintenance cost by itself. The OS file cache is uncontrolled
+even when the process-local statistics cache is freshly opened. Run only
+selected slices with the campaign's `recipe` mode and calibrated three-pair
+protocol; these synthetic results do not change the `wal` default.
+
+The write-cost matrix also includes paired `wal`/`durable` 256-document cuts
+for one insert, one update, one delete and a four-commit mixed workload from a
+second handle. Each unit must return a durable write ACK. Maintenance time,
+each ACK duration and signed allocated database/WAL byte changes are recorded
+outside search timing; a fresh handle then measures the read. A later read-only
+reopen checks the input-derived ID/score/corpus oracle and `verify("all")` after
+checkpoint. The mixed cut demonstrates visibility across handles, but four
+sequential commits do not establish simultaneous writer throughput. These
+costs are compared by operation and mode; they are not pooled into one update
+distribution or described as logical WAL append bytes.
+
+The operational runner produces separate authenticated outputs for P1–P5.
+After all five finish, `python -m bench.harness.rf11_partition_closure --p1
+<P1-output> --p2 <P2-output> --p3 <P3-output> --p4 <P4-output> --p5
+<P5-output> --output <closure.json>` verifies each runner receipt, raw/report
+recomputation, artifact hashes, the exact 25 scenario names, and a common
+baseline, candidate, runner and interpreter. An absent, altered, failed or
+inconclusive partition cannot produce a global `tradeoff_reported` decision.
+The closure links the five reports; their per-scenario costs and raw samples
+remain the authority for a limited recommendation.
+
+## RF01 historical total-overhead qualification
+
+This optional temporal profile is retained for a future measured-overhead
+claim. The completed structural and lifecycle checks do not imply that its
+timing thresholds have passed.
+
+RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`
+only against the immutable original baseline
+`3a2239a0bda80223c298a68d6d14f3c951f133d2`, with a distinct committed candidate.
+Supply `--memory-budget` explicitly and `--max-cpu-percent 20` (or lower),
+alongside the existing baseline/candidate, scenario, output and calibration arguments.
+This profile currently supports single-statement read controls, including cursor
+consumption; FTS, concurrent writers and retained-reader profiles are rejected.
+
+The worker verifies imported engine paths and Git blob hashes. Arm A retains
+`logical_memory_peak_bytes: null` with the sole accepted reason
+`revision_has_no_logical_memory_observer`; it never fabricates zero or patches the
+historical engine. Both arms require real process lifetime peak RSS. RSS is not a
+per-query allocation measurement. Arm B requires real logical observation with
+the same explicitly configured operator budget as A. This exception qualifies
+only RF01 total noop timing, never comparative logical memory or RF02+ gains.
+An observer-patched control remains diagnostic rather than the historical baseline.
+
+Each candidate worker also produces separate, untimed lifecycle evidence: twenty
+successful sort executions, twenty execution errors after retention, and twenty
+partially consumed cursors cancelled on the same private handle per configured
+budget. The evidence checks simultaneous logical peaks, individual operator
+ceilings, no open transactions, return of live accounting to its prior state and
+no retained growth across those repetitions. Operator peaks are never summed.
+This is bounded evidence for these lifecycle paths and instrumented accounting,
+not a proof that all Python allocations or every query are leak-free. Receipts
+bind the procedure digest, engine hashes, revision, process and invocation;
+they are unsigned local evidence, not independent authenticated certification.
+
+Semantic hashes, identical contracts, calibration, host CPU at control points
+at most 20%, within-process CV at most 10%, three AB/BA/AB pairs, five warmups
+and twenty retained samples per arm remain mandatory. Noop limits remain 3%
+median and 5% p95; only one entire repeat after an inconclusive campaign is
+allowed. Missing candidate memory or missing memory outside this exact profile
+still fails closed. Implementation and functional tests do not establish an
+overhead pass: a valid campaign is still required, and no gain is claimed.
+
+## RF05 and RF06 qualification selectors
+
+RF05 uses the six `rf05-{first,membership,dynamic_membership,keyset,skip,no_index}-n1024-p16`
+cases in an A/B optimization campaign. Select `rf05-first-n1024-p16` as the
+target with `--target rf05-first-n1024-p16:physical_node_versions_examined`;
+the other five remain timing controls. Apply the same positive `--memory-budget`
+to both revisions. The ordered oracle retains the exact public sequence,
+including timestamp ties and keyset boundary. The first page must show bounded
+`ordered_candidates_examined` and lower physical node work; fallback controls
+must not be credited as index wins. The optimization threshold is a median
+candidate/base ratio at most 0.90 per pair, with controls at most 1.05 median
+and 1.10 p95, calibrated executor, real CPU/RSS and raw hashes as in RF01.
+The worker uses the materializing `db.execute` API: `elapsed_ns` and
+`consume_all_ns` cover the complete page, while `first_row_ns` is `null`.
+This campaign makes no first-row latency claim.
+The qualified candidate must report `OrderedNodeMerge` in the plan and actual
+ordered counters: 16 examined candidates and 16 returned rows for the first
+page, 32 examined for the two membership controls, and no ordered merge for
+`skip` or `no_index`. The report retains these counts by arm and pair; the plan
+alone never substitutes for executed work.
+
+RF06 uses `--rf06-split-memory` and the **exact** six-case matrix returned by
+`quota_qualification.qualification_matrix(Scenario)`, in its declared order.
+For each of `max_intermediate_rows`, `max_traversal_paths` and
+`max_traversal_expansions`, the 128-destination target keeps that traversal
+quota at 128 in both revisions and has no `query_memory_budget_bytes`; this
+permits the quota-aware batch. The paired control uses the same 128-destination
+fixture, query and traversal quota, adding only a 1 MiB query-memory budget in
+both revisions. This must retain the scalar path. Do not supply `--memory-budget`, `--target`,
+historical flags or a candidate-only memory configuration. Both source arms
+run the identical query and configuration for each case.
+
+The RF06 target's logical peak is honestly `null` with reason
+`query_memory_budget_disabled` in **both** arms. The target retains real
+process-lifetime RSS, CPU and physical `certificate_attempts`; its baseline
+must be scalar and its candidate must form two groups of 64 without changing
+the 128 candidate landings. Each budgeted scalar control must report a covered
+logical peak at or below its budget and no group. After timing, five extra
+reads on one control handle
+prove that owner/endpoint retained bytes return to the same baseline and no
+read transaction remains. This proves the scalar fallback under budget, not a
+per-query allocation bound for the unbudgeted target. The report explicitly
+marks comparative target logical memory unavailable. The usual A/B temporal,
+semantic, physical-work, calibration and noise gates still apply. A final
+qualified claim also needs the RF06 Spec's formally revised memory criterion;
+this harness profile alone does not revise that criterion.

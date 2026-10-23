@@ -10,7 +10,11 @@ from okto_grafx.errors import GrafxError, GrafxConfigurationError, GrafxQueryBud
 
 pytestmark = pytest.mark.optional_dependency("pyarrow")
 pa = pytest.importorskip("pyarrow")
-ROUTES = ("arrow", "pandas", "polars", "parquet")
+ROUTES = (
+    "arrow", "pandas",
+    pytest.param("polars", marks=pytest.mark.optional_dependency("polars")),
+    "parquet",
+)
 VALUES = (DecimalValue(10**38 - 1, 38, 19), DecimalValue(-1234500, 12, 4),
           DecimalValue(0, 38, 38), DecimalValue(-9, 1, 0))
 KINDS = ("INT64", *(ArrowDecimalType(v.precision, v.scale) for v in VALUES))
@@ -261,6 +265,7 @@ def test_pandas_decimal_schema_and_arrow_dtype_must_both_match(tmp_path, fault):
 
 
 @pytest.mark.parametrize("fault", ["precision", "scale", "float", "metadata"])
+@pytest.mark.optional_dependency("polars")
 def test_polars_decimal_actual_and_wrapper_schema_must_both_match(tmp_path, fault):
     pl = pytest.importorskip("polars")
     from okto_grafx.polars import PolarsFrame

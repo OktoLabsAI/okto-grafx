@@ -470,9 +470,11 @@ _UNATTRIBUTED: list[tuple[str, str]] = []
 _REASONS: dict[str, str] = {}
 _COLLECTED_FILES: set[str] = set()
 _ITEMS_BY_ID: dict[str, pytest.Item] = {}
+_PENDING_XDIST_SKIPS: dict[object, set[str]] = {}
 _VANISHED: list[str] = []
 _ERRORED_FILES: set[str] = set()
 _COLLECTED_IDS: dict[str, pytest.Item] = {}
+_XDIST_COLLECTED_IDS: set[str] = set()
 _REPORTED_IDS: set[str] = set()
 _DESELECTED_IDS: set[str] = set()
 _DECLARED_DISTRIBUTIONS: frozenset[str] = frozenset()
@@ -569,6 +571,84 @@ def _source_markers(path: str, test_name: str) -> dict[str, tuple[str, ...]]:
 
     visit(tree, {})
     _SOURCE_MARKERS[key] = found
+    return found
+
+
+def _source_parameter_markers(
+    path: str, test_name: str, item: pytest.Item
+) -> dict[str, tuple[str, ...]]:
+    """Read literal pytest.param markers only for the matching live parameter value.
+
+    A marker on another case in the same parametrized function cannot pay for this case,
+    even if a collection hook adds that marker to the live item later.
+    """
+    callspec = getattr(item, "callspec", None)
+    tree = _parse(path)
+    if callspec is None or tree is None:
+        return {}
+    assignments = {
+        target.id: statement.value
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    found: dict[str, tuple[str, ...]] = {}
+    for function in tree.body:
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) or function.name != test_name:
+            continue
+        for decorator in function.decorator_list:
+            if not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Attribute):
+                continue
+            owner = decorator.func.value
+            if not (
+                decorator.func.attr == "parametrize"
+                and isinstance(owner, ast.Attribute)
+                and owner.attr == "mark"
+                and isinstance(owner.value, ast.Name)
+                and owner.value.id == "pytest"
+                and len(decorator.args) >= 2
+            ):
+                continue
+            argument, cases = decorator.args[:2]
+            if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str):
+                continue
+            names = [name.strip() for name in argument.value.split(",")]
+            if len(names) != 1 or names[0] not in callspec.params:
+                continue
+            if isinstance(cases, ast.Name):
+                cases = assignments.get(cases.id, cases)
+            if not isinstance(cases, (ast.Tuple, ast.List)):
+                continue
+            matching: list[ast.expr] = []
+            actual = callspec.params[names[0]]
+            for case in cases.elts:
+                is_param = (
+                    isinstance(case, ast.Call)
+                    and isinstance(case.func, ast.Attribute)
+                    and case.func.attr == "param"
+                    and isinstance(case.func.value, ast.Name)
+                    and case.func.value.id == "pytest"
+                    and case.args
+                )
+                value = case.args[0] if is_param else case
+                if (
+                    isinstance(value, ast.Constant)
+                    and type(value.value) is type(actual)
+                    and value.value == actual
+                ):
+                    matching.append(case)
+            if len(matching) != 1:
+                continue
+            case = matching[0]
+            if not isinstance(case, ast.Call):
+                continue
+            for keyword in case.keywords:
+                if keyword.arg != "marks":
+                    continue
+                marks = keyword.value.elts if isinstance(keyword.value, (ast.Tuple, ast.List)) else [keyword.value]
+                for mark in marks:
+                    found.update(_marker_of(mark))
     return found
 
 
@@ -1048,7 +1128,8 @@ def _attribution(item: pytest.Item | None) -> str | None:
         return None
     path = str(getattr(item, "path", "") or getattr(item, "fspath", ""))
     name = getattr(item, "originalname", None) or item.name.split("[")[0]
-    written = _source_markers(path, name)
+    written = dict(_source_markers(path, name))
+    written.update(_source_parameter_markers(path, name, item))
     registered = _registered_markers(item.config)
     live = {marker.name for marker in item.iter_markers()}
     claimed = set(written) & ATTRIBUTING_MARKERS & registered & live
@@ -1278,6 +1359,23 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             _COLLECTED_FILES.add(str(pathlib.Path(path).resolve()))
 
 
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_node_collection_finished(node: object, ids: list[str]) -> None:
+    """Mirror each worker's collected modules in the xdist controller.
+
+    The controller receives test reports, but never runs collection_modifyitems.
+    Its disappearance check still needs the workers' actual collection inventory.
+    The controller also reconciles all collected ids against reports from every worker.
+    A worker sees the entire collection but reports only its scheduled share.
+    """
+    rootpath = pathlib.Path(str(node.config.rootpath))
+    _XDIST_COLLECTED_IDS.update(ids)
+    for nodeid in ids:
+        path = nodeid.split("::", 1)[0]
+        if path.endswith(".py"):
+            _COLLECTED_FILES.add(str((rootpath / path).resolve()))
+
+
 def pytest_itemcollected(item: pytest.Item) -> None:
     """Record every item at the moment pytest collects it (A69, D2).
 
@@ -1307,10 +1405,22 @@ def pytest_runtest_protocol(item: pytest.Item) -> None:
     _ITEMS_BY_ID[item.nodeid] = item
 
 
+def _defer_xdist_skip(report: pytest.TestReport) -> bool:
+    """Wait for the worker's source-checked verdict when this report came from xdist."""
+    node = getattr(report, "node", None)
+    if node is None:
+        return False
+    _PENDING_XDIST_SKIPS.setdefault(node, set()).add(report.nodeid)
+    return True
+
+
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     """Record every skipped test, and note that this node produced a report at all (A69)."""
     _REPORTED_IDS.add(report.nodeid)
     if hasattr(report, "wasxfail"):
+        if _defer_xdist_skip(report):
+            _REASONS.setdefault(report.nodeid, "x-failed without a source-visible marker")
+            return
         # An x-fail is the same invariant as a skip: the marker must be visible in the source,
         # so a collection-time add_marker(xfail) cannot suppress a failure. Enforcing it for
         # skip and not for xfail was two paths for one rule.
@@ -1322,7 +1432,29 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if not report.skipped:
         return
     _REASONS.setdefault(report.nodeid, _skip_reason(report))
+    if _defer_xdist_skip(report):
+        return
     _record_skip(report.nodeid, _ITEMS_BY_ID.get(report.nodeid))
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: object, error: object | None) -> None:
+    """Accept only skip verdicts the worker checked against its real pytest item."""
+    pending = _PENDING_XDIST_SKIPS.pop(node, set())
+    if not pending:
+        return
+    output = getattr(node, "workeroutput", None)
+    verdicts = (
+        output.get("g4_attributed_skips")
+        if error is None and isinstance(output, dict)
+        else None
+    )
+    for nodeid in pending:
+        verdict = verdicts.get(nodeid) if isinstance(verdicts, dict) else None
+        if isinstance(verdict, str) and verdict:
+            _ATTRIBUTED[nodeid] = verdict
+        else:
+            _record_skip(nodeid, None)
 
 
 def pytest_collectreport(report: pytest.CollectReport) -> None:
@@ -1380,6 +1512,12 @@ def _reconcile(session: pytest.Session) -> list[str]:
         return []
     if getattr(session, "shouldstop", False) or getattr(session, "shouldfail", False):
         return []
+    if getattr(session.config, "workerinput", None) is not None:
+        # Every xdist worker collects the full suite, but runs only its assigned items.
+        # The controller sees every report and performs the global reconciliation below.
+        return []
+    if _XDIST_COLLECTED_IDS:
+        return sorted(_XDIST_COLLECTED_IDS - _REPORTED_IDS - _DESELECTED_IDS)
     silent: list[str] = []
     for nodeid, item in _COLLECTED_IDS.items():
         if nodeid in _REPORTED_IDS or nodeid in _DESELECTED_IDS:
@@ -1392,6 +1530,11 @@ def _reconcile(session: pytest.Session) -> list[str]:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Fail the session when a skip or a disappearance could not be attributed."""
+    # A crashed worker has no source-checked verdict. Its reports cannot earn attribution.
+    for pending in _PENDING_XDIST_SKIPS.values():
+        for nodeid in pending:
+            _record_skip(nodeid, None)
+    _PENDING_XDIST_SKIPS.clear()
     for nodeid in _reconcile(session):
         entry = (nodeid, "collected but never reported")
         if entry not in _UNATTRIBUTED:
@@ -1403,5 +1546,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             if _declared_absent(module):
                 continue
             _VANISHED.append(str(module))
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if isinstance(workeroutput, dict):
+        workeroutput["g4_attributed_skips"] = dict(_ATTRIBUTED)
     if (_UNATTRIBUTED or _VANISHED) and exitstatus == 0:
         session.exitstatus = 1

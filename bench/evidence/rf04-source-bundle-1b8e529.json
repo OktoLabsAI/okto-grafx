@@ -1,0 +1,36 @@
+{
+  "arm_inventory_sha256": {
+    "base": "49bdbc01973741d0a1fe187d069b9f388acd04dfd0922d087213f3e3a2bb384f",
+    "both": "de4381e62fb1b73b7df7995b3d21fbefced5963a02331924fa33a422405625e6",
+    "rf03_only": "b92d4dbab504f106cd1e454a5674c8847174eda9c1e4fe75ad89d50a0468f2b0",
+    "rf04_only": "aeb45776f23f6de5799b26565696102a645ff26153f4f4c3d6e88a94a02b8fda"
+  },
+  "arm_switch_blobs": {
+    "base": {
+      "src/okto_grafx/domain/query/planner.py": "d0d7354b7fd0e905dcd44da1a678299358c6e41c8dd027de720d334c66c1b65b",
+      "src/okto_grafx/engine/query_engine.py": "db9c13b1791a059fe0e4f21cabbb1214803f3ac1af94b842e6dc198e6a434861"
+    },
+    "both": {
+      "src/okto_grafx/domain/query/planner.py": "ebae224bbf9352d814e4847a2f5e18fa275462ce3aff7d1fd138f59fdb35b55d",
+      "src/okto_grafx/engine/query_engine.py": "fd5637f779d7f313f58a4e3820878c948c2d8dc853735ed2358b62b587b675e6"
+    },
+    "rf03_only": {
+      "src/okto_grafx/domain/query/planner.py": "ebae224bbf9352d814e4847a2f5e18fa275462ce3aff7d1fd138f59fdb35b55d",
+      "src/okto_grafx/engine/query_engine.py": "db9c13b1791a059fe0e4f21cabbb1214803f3ac1af94b842e6dc198e6a434861"
+    },
+    "rf04_only": {
+      "src/okto_grafx/domain/query/planner.py": "d0d7354b7fd0e905dcd44da1a678299358c6e41c8dd027de720d334c66c1b65b",
+      "src/okto_grafx/engine/query_engine.py": "fd5637f779d7f313f58a4e3820878c948c2d8dc853735ed2358b62b587b675e6"
+    }
+  },
+  "candidate_inventory_sha256": "de4381e62fb1b73b7df7995b3d21fbefced5963a02331924fa33a422405625e6",
+  "file_count": 282,
+  "guard_blob_sha256": "676469e318b9750e0283b0e4c3ed16bd2dee052a7b640d5a055ffcc47e79f5fc",
+  "revisions": {
+    "base": "da8d821b233a792553a833d69050aa19be2778aa",
+    "both": "1b8e5291a5dd77e8725297f86af9333237ec34e2",
+    "rf03_only": "237775048ab4ee162a563328215e4ce2c6029f2f",
+    "rf04_only": "3736ae08a5ca30310b4f383e001258bf98f4fb52"
+  },
+  "schema_version": "grafx-rf04-source-bundle/v2"
+}

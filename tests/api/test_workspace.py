@@ -174,6 +174,18 @@ def test_windows_namespace_aliases_refused(tree, suffix):
         policy.paths.resolve(str(root) + "/" + suffix, existing=False)
 
 
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason="POSIX literal path namespace contract")
+@pytest.mark.parametrize("suffix", [".. /outside", "name.", "name ", "file:stream"])
+def test_posix_namespace_names_remain_literal(tree, suffix):
+    root, _, _, policy = tree
+    before = set(root.rglob("*"))
+    assert policy.paths.resolve(str(root) + "/" + suffix, existing=False) == str(
+        root / suffix
+    )
+    assert set(root.rglob("*")) == before
+
+
 def test_path_flag_and_null_refused(tree):
     root, _, _, policy = tree
     with pytest.raises(GrafxConfigurationError):

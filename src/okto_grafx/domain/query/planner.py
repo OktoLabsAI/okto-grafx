@@ -500,6 +500,8 @@ class _Planner:
     capture_paths: set[str] = field(default_factory=set)
     bound_paths: set[str] = field(default_factory=set)
     unwind_alias: str | None = None
+    # Lowered binding identities carried by the current driving pipeline.
+    scalar_unwind_bindings: set[str] = field(default_factory=set)
     unwind_source: Expression | None = None
     unwind_sources: dict[str, Expression] = field(default_factory=dict)
     alias_definitions: dict[str, Expression] = field(default_factory=dict)
@@ -1524,6 +1526,7 @@ class _Planner:
                 continue
             if isinstance(clause, UnwindClause):
                 self.unwind_alias = clause.alias
+                self.scalar_unwind_bindings.add(clause.alias)
                 self.unwind_source = clause.expression
                 self.unwind_sources[clause.alias] = clause.expression
                 proof = entity_sources(clause.expression, self._binding_entity_kind)
@@ -1753,6 +1756,14 @@ class _Planner:
                 ReturnItem(expression=Variable(item.name), alias=item.name) for item in clause.items
             ))
             pipeline = self._restore_imports(pipeline)
+        # WITH projects a new scope. Only a direct carry/rename preserves the
+        # UNWIND witness; a computed value with the same spelling does not.
+        # Aggregate boundaries remain conservative even for grouping keys.
+        self.scalar_unwind_bindings = set() if aggregations else {
+            item.name for item in clause.items
+            if isinstance(item.expression, Variable)
+            and item.expression.name in self.scalar_unwind_bindings
+        }
         return pipeline
 
 
@@ -2966,6 +2977,7 @@ class _Planner:
             terms,
             standalone=not pattern.relationships or zero_anchor or (inferred is None and not first.labels),
             inferred_table=inferred,
+            connected_key_seek=self._connected_key_seek_is_total(pattern, terms),
         )
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
@@ -2996,6 +3008,45 @@ class _Planner:
             self.bound_paths.add(pattern.variable)
         return pipeline, terms
 
+    def _connected_key_seek_is_total(
+        self, pattern: PatternPath, terms: Sequence[Expression]
+    ) -> bool:
+        """Prove the bounded connected context in which an anchor may be skipped.
+
+        The existing multi-key helper still proves SingleRow, leading PK IN,
+        parameter shape and index authority. Here, no inline expression or
+        later pattern may refuse on an anchor eliminated before traversal.
+        Keep unknown/correlated/optional/updating contexts on their old path.
+        """
+        statement = self.analysis.statement
+        if (not isinstance(statement, Query) or statement.writes
+                or len(statement.match_clauses) != 1
+                or statement.match_clauses[0].optional
+                or len(statement.match_clauses[0].patterns) != 1
+                or len(pattern.nodes) != 2 or len(pattern.relationships) != 1
+                or pattern.variable is not None):
+            return False
+        original = statement.match_clauses[0].patterns[0]
+        # _match_clause lowers inline relationship maps into later predicates;
+        # inspect the authored pattern too, before that expression disappears.
+        if (pattern != original
+                or any(item.properties is not None for item in (*original.nodes, *original.relationships))):
+            return False
+        first, target = pattern.nodes
+        edge = pattern.relationships[0]
+        if (first.variable is None or len(first.labels) != 1
+                or len(target.labels) != 1 or len(edge.types) != 1
+                or edge.min_hops != 1 or edge.max_hops != 1
+                or edge.hop_range_written or edge.direction is Direction.UNDIRECTED
+                or any(item.properties is not None for item in (first, edge, target))):
+            return False
+        return all(
+            self._ordered_filter_is_total(term, first.variable)
+            and not any(isinstance(item, BinaryOperation) and item.operator == "OR"
+                        for item in walk(term))
+            for term in terms[1:]
+        )
+
     def _match_node(
         self,
         pipeline: PlanNode,
@@ -3004,6 +3055,7 @@ class _Planner:
         *,
         standalone: bool = True,
         inferred_table: TableDef | None = None,
+        connected_key_seek: bool = False,
     ) -> tuple[PlanNode, list[Expression], str]:
         """Bind one node of a pattern, as a reference, an index seek or a scan.
 
@@ -3065,7 +3117,7 @@ class _Planner:
         seek, remaining = self._index_seek(pipeline, variable, table, terms)
         if seek is not None:
             return membership(seek), remaining, variable
-        if standalone:
+        if standalone or connected_key_seek:
             keyed = self._node_multi_key_seek(pipeline, variable, table, terms)
             if keyed is not None:
                 return membership(keyed), terms, variable
@@ -3078,7 +3130,7 @@ class _Planner:
         table: TableDef,
         terms: Sequence[Expression],
     ) -> PlanNode | None:
-        """Return the multi-key seek for ``n.pk IN $keys`` leading a standalone labelled node.
+        """Return the multi-key seek for ``n.pk IN $keys`` in a proven labelled-node context.
 
         NODE-IN-SEEK.  The term must be the first local term of the conjunction: seeking on a
         later conjunct would evaluate it before the terms written ahead of it and could suppress
@@ -3489,6 +3541,9 @@ class _Planner:
                 continue
             if not self._seekable_key(value):
                 continue
+            if isinstance(value, Variable) and subject.key != table.primary_key:
+                # RF02 admits scalar input only for the primary-key equality.
+                continue
             if self._column_of(table, subject.key) is None:
                 raise GrafxPlanError(
                     f"Table {table.name!r} has no column named {subject.key!r}.",
@@ -3513,6 +3568,12 @@ class _Planner:
 
         if isinstance(value, (Literal, Parameter)):
             return not free_variables(value)
+        if isinstance(value, Variable):
+            # A scan and a seek do not have interchangeable read phases when
+            # later writes revisit the same key. Keep the canonical pipeline
+            # for updating statements, including writes in nested subqueries.
+            return (value.name in self.scalar_unwind_bindings
+                    and not self.analysis.statement.writes)
         if self.unwind_alias is None:
             return False
         return (
@@ -4664,16 +4725,34 @@ class _Planner:
 
         predicate: Expression | None = None
         scan = pipeline
-        if isinstance(scan, FilterRows):
-            predicate = scan.predicate
+        while isinstance(scan, FilterRows):
+            if predicate is not None and not isinstance(scan.predicate, LabelPredicate):
+                # Separate WHERE stages drop NULL before the outer stage runs;
+                # combining arbitrary stages with AND would evaluate its RHS.
+                # A membership test on this concrete node source is two-valued.
+                return None
+            # Preserve every membership/WHERE predicate. Inner filters run first;
+            # totality below is required before a bounded ordered read is legal.
+            predicate = (scan.predicate if predicate is None else
+                         BinaryOperation("AND", scan.predicate, predicate))
             scan = scan.child
         if (
-            not isinstance(scan, AllNodesScan)
+            not isinstance(scan, (AllNodesScan, NodeScan))
             or not isinstance(scan.child, SingleRow)
             or scan.variable != first_subject.name
-            or not scan.tables
         ):
             return None
+        tables = (scan.table,) if isinstance(scan, NodeScan) else scan.tables
+        if not tables:
+            return None
+        pending = [] if predicate is None else [predicate]
+        while pending:
+            expression = pending.pop()
+            # RF05 adds only unambiguous label ownership. Existing unlabeled
+            # polymorphic merges keep their original eligibility and fallback.
+            if isinstance(expression, LabelPredicate) and len(tables) != 1:
+                return None
+            pending.extend(expression.children())
         if predicate is not None and not self._ordered_filter_is_total(
             predicate, scan.variable
         ):
@@ -4688,7 +4767,7 @@ class _Planner:
         string_column = second.expression.key
         ordered_tables: list[TableDef] = []
         index_names: list[str] = []
-        for table in scan.tables:
+        for table in tables:
             timestamp_definition = self._column_of(table, timestamp_column)
             string_definition = self._column_of(table, string_column)
             if timestamp_definition is None or string_definition is None:
@@ -4804,6 +4883,10 @@ class _Planner:
     def _ordered_filter_is_total(expression: Expression, variable: str) -> bool:
         """Admit only the scalar predicate subset that cannot hide a late refusal."""
 
+        if isinstance(expression, LabelPredicate):
+            # The selected source supplies a real node binding. Membership is
+            # evaluated from its MVCC version, never inferred from the table name.
+            return isinstance(expression.subject, Variable) and expression.subject.name == variable
         if isinstance(expression, NullCheck):
             return _Planner._ordered_filter_operand(expression.operand, variable)
         if isinstance(expression, UnaryOperation):

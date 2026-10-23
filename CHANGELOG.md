@@ -7,6 +7,68 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### RF01–RF12 structural performance and consistency round
+
+- Deliver physical-work diagnostics, proven scalar and connected seeks,
+  conditional endpoint access, bounded ordered pages, quota-aware landing
+  batches and eligible grouped uniqueness probes. Preserve exact results,
+  fallbacks, memory limits, streaming demand, rollback, durable ACK and reopen.
+- Add ingestion, read-lifecycle, full-text statistics and capacity decision
+  recipes with executable correctness, ownership and recovery proofs. The
+  full-text harness separates ranking, statistics-source and maintenance-cost
+  observations by operation. Capacity diagnostics do not change defaults or
+  authorize storage maintenance.
+- Qualify the implemented behavior with deterministic structural and functional
+  evidence. Calibrated latency gains and RF01 total counter overhead have not
+  been certified; earlier timing attempts under host load were inconclusive.
+
+### RF05 ordered pages with label membership
+
+- Admit a single label-selected node owner to the existing ordered page path,
+  preserving membership before LIMIT and canonical fallbacks. Add exact-sequence,
+  bounded-candidate, snapshot and refusal tests. See
+  [eligibility and limits](docs/RF05_PAGINATION.md); no temporal gain is claimed.
+
+### RF10 explicit read lifecycle recipes
+
+- Document shared versus independent read snapshots, 16-key groups, keyset
+  pages, detached results and partial cursor cleanup. Add deterministic tests
+  for external publication, transaction counts, participant release and primary
+  error preservation. No engine/default change or temporal gain is claimed.
+
+### RF07 streaming protection
+
+- Add executable LIMIT 0/1, partial-close, filter/DISTINCT, corruption/duplicate,
+  cancellation/deadline and generation-failure protections for streaming landings.
+  Preserve scalar demand and the existing closed-consumer batches; record the
+  [negative prefetch feasibility result](docs/PERFORMANCE.md#rf07-streaming-landing-demand)
+  without a streaming performance claim. Standalone unittest entry points
+  exercise the same demand and cleanup contract.
+
+### RF01 physical scan diagnostics
+
+- Implement the formally revised RF01 historical noop profile: preserve missing
+  baseline logical memory explicitly, require RSS in both arms and separately
+  verify candidate accounting lifecycle and operator budgets. All timing and
+  noise gates remain; no measured overhead pass or performance gain is claimed.
+  See [historical qualification](docs/PERFORMANCE.md#rf01-historical-total-overhead-qualification).
+
+- Add statement-local counters for physical node/relationship versions,
+  index probes, certificate attempts/retries and identity landing work.
+  Record the first executed fallback guard with a bounded integer diagnostic.
+  Isolate cursor pulls and preserve logical counters, cancellation checkpoints
+  and quota charging. Structural qualification covers semantics and accounting;
+  measured overhead remains unqualified.
+  See [measurement boundaries](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
+- Add a development campaign with typed semantic oracles, raw six-process
+  AB/BA/AB samples and fail-closed comparison, plus an opt-in simultaneous
+  logical-budget observer. Preserve quota behavior and report unavailable
+  memory coverage explicitly. The first overhead comparison and its aborted
+  readiness-gated repeat are inconclusive; no speedup or overhead pass is claimed.
+  A real same-revision smoke and a compatible observer-control comparison both
+  validated 150 raw samples; the latter remains temporally inconclusive under
+  high host load.
+
 ### CI portability and execution policy
 
 - Move the full Windows/POSIX regression matrix and its coverage report to manual

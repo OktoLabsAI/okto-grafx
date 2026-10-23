@@ -26,7 +26,11 @@ def schema(db):
         tx.execute("CREATE NODE TABLE N(" + ",".join(f"{name} {kind}" for name, kind in zip(NAMES, KINDS)) + ", PRIMARY KEY(id))")
 
 
-@pytest.mark.parametrize("transport", ["arrow", "pandas", "polars", "parquet"])
+@pytest.mark.parametrize("transport", [
+    "arrow", "pandas",
+    pytest.param("polars", marks=pytest.mark.optional_dependency("polars")),
+    "parquet",
+])
 @pytest.mark.parametrize("codec", ["pure", "numpy"])
 def test_native_temporal_roundtrip_all_tabular_routes(tmp_path, transport, codec):
     source = result()
@@ -154,6 +158,7 @@ def test_pandas_temporal_metadata_is_mandatory(tmp_path, fault):
 
 
 @pytest.mark.parametrize("fault", ["null_child", "wide_integer", "extra_field"])
+@pytest.mark.optional_dependency("polars")
 def test_polars_temporal_normalization_does_not_admit_wrong_coordinates(tmp_path, fault):
     pl = pytest.importorskip("polars")
     from okto_grafx.polars import PolarsFrame, to_polars, import_polars

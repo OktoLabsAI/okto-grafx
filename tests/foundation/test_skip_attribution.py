@@ -435,6 +435,101 @@ def test_collect_ignore_cannot_remove_a_module(tmp_path: Path) -> None:
     assert "vanished" in output
 
 
+def test_xdist_collection_reaches_controller_without_weakening_disappearance_gate(
+    tmp_path: Path,
+) -> None:
+    xdist = ("-p", "xdist.plugin", "-n", "2")
+    passing = HEADER + "def test_planted() -> None:\n    assert True\n"
+    code, output = _plant(tmp_path / "present", module=passing, extra_arguments=xdist)
+    assert code == 0, output
+    assert "vanished from collection" not in output
+
+    ignored = tmp_path / "ignored"
+    code, output = _plant(
+        ignored,
+        module=passing,
+        conftest_extra='\n\ncollect_ignore = ["test_planted.py"]\n',
+        extra_arguments=xdist,
+    )
+    assert code != 0, output
+    assert "test_planted.py" in output
+    assert "vanished from collection" in output
+
+
+def test_xdist_reconciles_all_worker_reports_and_catches_a_silent_item(tmp_path: Path) -> None:
+    xdist = ("-p", "xdist.plugin", "-n", "2")
+    passing = HEADER + "@pytest.mark.parametrize('n', range(8))\ndef test_planted(n):\n    assert n < 8\n"
+    worker_audit = (
+        "\n\ndef pytest_unconfigure(config):\n"
+        "    worker = getattr(config, 'workerinput', None)\n"
+        "    if worker is not None:\n"
+        "        (pathlib.Path(config.rootpath) / f\"g4-{worker['workerid']}.txt\").write_text(\n"
+        "            repr(_UNATTRIBUTED), encoding='utf-8'\n"
+        "        )\n"
+    )
+    reported = tmp_path / "reported"
+    code, output = _plant(
+        reported, module=passing, conftest_extra=worker_audit, extra_arguments=xdist
+    )
+    assert code == 0, output
+    assert "collected but never reported" not in output
+    worker_verdicts = sorted(reported.glob("g4-*.txt"))
+    assert len(worker_verdicts) == 2, output
+    assert all(path.read_text(encoding="utf-8") == "[]" for path in worker_verdicts), output
+
+    # A worker can claim that it handled an item while sending no report. The controller's
+    # complete collection and merged reports must still expose this loss after distribution.
+    nested_conftest = (
+        "\n\ndef pytest_runtest_protocol(item, nextitem):\n"
+        "    if 'test_silent' in item.nodeid:\n"
+        "        return True\n"
+        "    return None\n"
+    )
+    nested_module = HEADER + "def test_silent() -> None:\n    assert False\n"
+    code, output = _plant(
+        tmp_path / "silent",
+        module=passing,
+        nested_conftest=nested_conftest,
+        nested_module=nested_module,
+        extra_arguments=xdist,
+    )
+    assert code == 1, output
+    assert "test_silent" in output
+    assert "collected but never reported" in output
+
+
+def test_xdist_skip_attribution_requires_a_source_visible_marker(tmp_path: Path) -> None:
+    xdist = ("-p", "xdist.plugin", "-n", "2")
+    marked = (
+        HEADER
+        + "@pytest.mark.pending\n"
+        + "def test_planted() -> None:\n    pytest.skip('declared debt')\n"
+    )
+    code, output = _plant(tmp_path / "marked", module=marked, extra_arguments=xdist)
+    assert code == 0, output
+    assert "unattributed skips" not in output
+
+    unmarked = _skipping_module("declared debt")
+    code, output = _plant(tmp_path / "unmarked", module=unmarked, extra_arguments=xdist)
+    assert code == 1, output
+    assert "test_planted.py::test_planted" in output
+    assert "unattributed skips" in output
+
+    # Even a genuinely marked skip must fail if its worker verdict never reaches the controller.
+    code, output = _plant(
+        tmp_path / "missing_verdict",
+        module=marked,
+        extra_arguments=xdist,
+        mutation=(
+            'workeroutput["g4_attributed_skips"] = dict(_ATTRIBUTED)',
+            'workeroutput["g4_attributed_skips"] = {}',
+        ),
+    )
+    assert code == 1, output
+    assert "test_planted.py::test_planted" in output
+    assert "unattributed skips" in output
+
+
 def test_an_ignore_collect_hook_cannot_remove_a_module(tmp_path: Path) -> None:
     conftest_extra = (
         "\n\ndef pytest_ignore_collect(collection_path, config):\n"
@@ -565,6 +660,71 @@ def test_a_declared_absent_optional_dependency_attributes(tmp_path: Path) -> Non
     )
     code, output = _plant(tmp_path, module=module)
     assert code == 0, output
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_a_parameter_marker_attributes_only_its_live_case(
+    tmp_path: Path, inline: bool
+) -> None:
+    cases = (
+        '["arrow", pytest.param("polars", marks=pytest.mark.optional_dependency("grafx_absent_probe"))]'
+    )
+    declaration = "" if inline else f"ROUTES = {cases}\n\n"
+    argument = cases if inline else "ROUTES"
+    module = (
+        HEADER
+        + declaration
+        + f'@pytest.mark.parametrize("route", {argument})\n'
+        + "def test_planted(route) -> None:\n"
+        + '    if route == "polars":\n'
+        + '        pytest.importorskip("grafx_absent_probe")\n'
+        + '    assert route == "arrow"\n'
+    )
+    code, output = _plant(tmp_path, module=module)
+    assert code == 0, output
+
+
+def test_a_parameter_marker_cannot_pay_for_another_case(tmp_path: Path) -> None:
+    module = (
+        HEADER
+        + '@pytest.mark.parametrize("route", ["arrow", '
+        'pytest.param("polars", marks=pytest.mark.optional_dependency("grafx_absent_probe"))])\n'
+        + "def test_planted(route) -> None:\n"
+        + '    if route == "arrow":\n'
+        + '        pytest.skip("undeclared skip on Arrow")\n'
+    )
+    nested_conftest = (
+        "\n\ndef pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        '        if getattr(item, "callspec", None) and item.callspec.params.get("route") == "arrow":\n'
+        '            item.add_marker(pytest.mark.optional_dependency("grafx_absent_probe"))\n'
+    )
+    code, output = _plant(tmp_path, nested_module=module, nested_conftest=nested_conftest)
+    assert code == 1, output
+    assert "skipped test(s) carry neither" in output
+
+
+def test_duplicate_parameter_value_does_not_borrow_a_marker(tmp_path: Path) -> None:
+    module = (
+        HEADER
+        + '@pytest.mark.parametrize("route", ['
+        'pytest.param("polars", marks=pytest.mark.optional_dependency("grafx_absent_probe")), '
+        '"polars"])\n'
+        + "def test_planted(route) -> None:\n"
+        + '    if not hasattr(pytest, "_skip_first"):\n'
+        + '        pytest._skip_first = True\n'
+        + '        pytest.importorskip("grafx_absent_probe")\n'
+        + '    pytest.skip("second duplicate is unmarked")\n'
+    )
+    nested_conftest = (
+        "\n\ndef pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        '        if getattr(item, "callspec", None) and item.callspec.indices.get("route") == 1:\n'
+        '            item.add_marker(pytest.mark.optional_dependency("grafx_absent_probe"))\n'
+    )
+    code, output = _plant(tmp_path, nested_module=module, nested_conftest=nested_conftest)
+    assert code == 1, output
+    assert "skipped test(s) carry neither" in output
 
 
 def test_a_declared_dependency_that_is_present_does_not_attribute(tmp_path: Path) -> None:

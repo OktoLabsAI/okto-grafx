@@ -1,0 +1,1835 @@
+{
+  "candidate_functional_guards": {
+    "module": "tests\\query\\test_conditional_endpoint_evidence.py",
+    "module_blob_sha256": "676469e318b9750e0283b0e4c3ed16bd2dee052a7b640d5a055ffcc47e79f5fc",
+    "passed_methods": [
+      "test_sixteen_starts_without_global_edge_census",
+      "test_fan_limit_and_actual_conditional_node_fallback",
+      "test_directions_parallel_self_loop_and_owned_overlay"
+    ],
+    "revision": "1b8e5291a5dd77e8725297f86af9333237ec34e2"
+  },
+  "observations": {
+    "base": {
+      "arm": "base",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 122910,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 393255,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 90080,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 66,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 130,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "da8d821b233a792553a833d69050aa19be2778aa",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    },
+    "both": {
+      "arm": "both",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 32,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 286,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 130,
+            "edge_lookups": 64,
+            "edge_scans": 1,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 194,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1407,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1874,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 64,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 32,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 286,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 130,
+            "edge_lookups": 64,
+            "edge_scans": 1,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 194,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1407,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1874,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 64,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "1b8e5291a5dd77e8725297f86af9333237ec34e2",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    },
+    "rf03_only": {
+      "arm": "rf03_only",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 66,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 130,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 66,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 130,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "237775048ab4ee162a563328215e4ce2c6029f2f",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    },
+    "rf04_only": {
+      "arm": "rf04_only",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 122910,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 393255,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 90080,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 32,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 286,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 130,
+            "edge_lookups": 64,
+            "edge_scans": 1,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 194,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1407,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1874,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 64,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "3736ae08a5ca30310b4f383e001258bf98f4fb52",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    }
+  },
+  "report": {
+    "arm_hashes": {
+      "base": "751e29e42de5bbe0fbe8b6c588468d0e79a9beffbbc3625419b8011d773273e8",
+      "both": "b4c8998dc48c58c4cf54c71c70b9cd4fc56cc2caffb6e9a539ac4248bde7a40c",
+      "rf03_only": "422a808e78d8038616604e8d2333de8cfe5c617589a78f518cffea948a9e9cbf",
+      "rf04_only": "d937acdfe4eec65d2d5636b0e97bc6b63412405ccc270c8d38ac8fc2de853b09"
+    },
+    "contrasts": {
+      "rf04-original-fallback": {
+        "base": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 32,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 286,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf03_only": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf04_only": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-original-fan_limit": {
+        "base": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 130,
+          "edge_lookups": 64,
+          "edge_scans": 1,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 194,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1407,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf03_only": {
+          "certificate_attempts": 66,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 130,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf04_only": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-original-hub": {
+        "base": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1874,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-original-target": {
+        "base": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 64,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-with-fallback": {
+        "base": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 32,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 286,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf03_only": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf04_only": {
+          "certificate_attempts": 32,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 286,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-with-fan_limit": {
+        "base": {
+          "certificate_attempts": 66,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 130,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "both": {
+          "certificate_attempts": 130,
+          "edge_lookups": 64,
+          "edge_scans": 1,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 194,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1407,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf03_only": {
+          "certificate_attempts": 66,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 130,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf04_only": {
+          "certificate_attempts": 130,
+          "edge_lookups": 64,
+          "edge_scans": 1,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 194,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1407,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        }
+      },
+      "rf04-with-hub": {
+        "base": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1874,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1874,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        }
+      },
+      "rf04-with-target": {
+        "base": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 64,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 64,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        }
+      }
+    },
+    "decision": "structural_pass",
+    "hub_tradeoffs": {
+      "original": {
+        "rf04_increases_physical_edge_work": true,
+        "with_rf04_edge_versions": 1874,
+        "without_rf04_edge_versions": 1151
+      },
+      "with": {
+        "rf04_increases_physical_edge_work": true,
+        "with_rf04_edge_versions": 1874,
+        "without_rf04_edge_versions": 1151
+      }
+    },
+    "latency_certified": false,
+    "schema_version": "grafx-rf04-structural-report/v1",
+    "scope": "input-derived ordered rows, equal fixtures/queries, physical counters, fan limit, hub and actual broad fallback; hub may increase physical edge work; no temporal gain asserted",
+    "source_isolation": {
+      "changed_files": {
+        "base_to_rf03_only": [
+          "src/okto_grafx/domain/query/planner.py"
+        ],
+        "base_to_rf04_only": [
+          "src/okto_grafx/engine/query_engine.py"
+        ],
+        "rf03_only_to_both": [
+          "src/okto_grafx/engine/query_engine.py"
+        ],
+        "rf04_only_to_both": [
+          "src/okto_grafx/domain/query/planner.py"
+        ]
+      },
+      "revisions": {
+        "base": "da8d821b233a792553a833d69050aa19be2778aa",
+        "both": "1b8e5291a5dd77e8725297f86af9333237ec34e2",
+        "rf03_only": "237775048ab4ee162a563328215e4ce2c6029f2f",
+        "rf04_only": "3736ae08a5ca30310b4f383e001258bf98f4fb52"
+      },
+      "scope": "all four commits have identical trees except the two isolated feature switches"
+    }
+  }
+}

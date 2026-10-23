@@ -101,34 +101,66 @@ Read `code`, `retryable`, `details` and the transaction's `report`; do not match
 exception text. The post-barrier regression explicitly marks its exception
 nonretryable. Custom trusted adapters may propagate their own exceptions.
 
-Conservative conflict-only recipe (the operation must not send external messages
-or perform non-idempotent host side effects inside the retried transaction):
+Conservative conflict-only application recipe. `operation(txn)` must recompute
+business decisions from that attempt's snapshot, not replay previously calculated
+values. It must not send external messages or perform host side effects. This is
+application code, not a new Grafx API. A fixed `statement, parameters` pair also
+remains usable for operations that do not require business recomputation. The
+budget bounds attempts, not elapsed time.
+`pause` permits an application-owned backoff/deadline policy outside the transaction.
+
+<!-- rf09-conflict-recipe -->
 
 ```python
 import random
 import time
 from okto_grafx.errors import GrafxWriteConflict
 
-def write_with_conflict_retry(db, statement, parameters, attempts=3):
+def write_with_conflict_retry(db, operation, parameters=None, attempts=3, pause=time.sleep):
+    if parameters is not None:
+        statement = operation
+        operation = lambda txn: txn.execute(statement, parameters)
     if attempts < 1:
         raise ValueError("attempts must be positive")
     for attempt in range(attempts):
         txn = None
+        cleanup_complete = False
         try:
-            with db.begin("write") as txn:
-                txn.execute(statement, parameters)
+            try:
+                with db.begin("write") as txn:
+                    operation(txn)
+            finally:
+                # A refusal from __exit__'s commit can leave the transaction active.
+                if txn is not None and txn.active:
+                    txn.rollback()
+                cleanup_complete = True
             return txn.report
         except GrafxWriteConflict as error:
-            if (error.details.get("committed") or error.details.get("durable")
+            if (not cleanup_complete
+                    or error.details.get("committed") or error.details.get("durable")
                     or (txn is not None and txn.report is not None and txn.report.durable)
+                    or not error.details.get("retryable", error.retryable)
                     or attempt + 1 == attempts):
                 raise
-            time.sleep(random.uniform(0, min(0.05 * 2**attempt, 0.5)))
+            pause(random.uniform(0, min(0.05 * 2**attempt, 0.5)))
 ```
 
 The explicit `db.retry(txn)` door is for an active owned transaction refused by
 optimistic validation; it returns a fresh successor, not a replay of statements.
 It is not a universal substitute for the outcome policy above.
+
+Decision order matters: first reject replay of a durable/committed report or
+exception; then classify an unknown outcome for reconciliation; only then consult
+`details["retryable"]` (when present, it overrides the exception class default).
+The example retries only eligible `GrafxWriteConflict`; it deliberately propagates
+other errors, including uncertain barrier outcomes. A retryable flag alone does
+not prove that an operation was uncommitted or that external effects can be repeated.
+The explicit `finally` retires an active commit refusal before backoff. The next `begin`
+creates a fresh snapshot; `db.retry` is not called on that already closed predecessor.
+Release owned cursors as well. If cleanup fails, stop and reconcile instead of
+continuing a business retry loop. After success, publish external effects through
+an application idempotency/confirmation protocol; Grafx cannot atomically commit a
+remote service's side effect. See the [batch boundary matrix](PERFORMANCE.md#ingestion-atomicity-and-cost).
 
 ## Recovery runbook
 
@@ -270,6 +302,48 @@ identities. Restart application processes after the maintenance window so their 
 adopts the new capability, floor and index authority. See
 [`docs/architecture/MVCC_VACUUM_V1.md`](architecture/MVCC_VACUUM_V1.md).
 
+### Capacity, retention and maintenance runbook
+
+Record the source revision, database configuration, workload shape, participant
+count and observation window before changing a setting. Keep three memory signals
+separate: process peak RSS is operating-system resident memory; the configured
+`buffer_budget_bytes` limits the page pool; query logical-memory peaks are charged
+estimates for instrumented operators. Neither logical peak nor page-pool budget is
+a process RSS ceiling. Compare like-for-like windows and collect the three signals
+independently. A growing RSS alone does not establish a retained Grafx snapshot or
+a leak; a stable logical charge alone does not rule out other Python allocations.
+
+For a suspected retention problem, inventory owned read transactions and cursors,
+their age and the last checkpoint. Close or roll back the readers that have
+finished; do not shorten their TTL to make a live snapshot disappear. Capture
+`db.maintenance.bloat()` and the checkpoint/WAL status before and after that
+ordinary lifecycle change. Its `recyclable_horizon_lsn` is capped by the last
+checkpoint **and** reader registrations. Closing a reader can leave the report
+unchanged until a separate checkpoint advances that cap. The census itself does
+not checkpoint, prune a registration, reclaim a page, or establish vacuum safety.
+Check `horizon_retained_versions`, `horizon_eligible_versions` and their **record
+slot** bytes; overflow payload bytes are excluded. These are physical-version
+estimates, not resident-memory or immediately recoverable disk-byte promises.
+
+Use the following matrix as a per-workload decision record. The named API and
+configuration fields are existing interfaces, not prescribed new defaults.
+
+| Signal and controlled sample | Potential local action | Cost and safety boundary | Decision |
+| --- | --- | --- | --- |
+| RSS, buffer occupancy and query logical peak across the same bounded read workload; note `buffer_budget_bytes`, `query_memory_budget_bytes` and concurrent handles | Keep the default if no resource pressure; otherwise test a local page-pool or query-budget change | More page-pool capacity consumes process memory; smaller budgets may refuse valid work. Neither budget bounds all Python/RSS use | Measure a paired candidate; never infer a leak from one signal |
+| IDs consumed versus reserved per committed implicit-ID batch; note `identity_lease_size` and the largest batch | Keep the default or test a local lease size against the observed batch distribution | The implicit-only reservation uses `max(identity_lease_size, batch length)`; shrinking the configured lease cannot cap a larger batch. IDs stay monotonic and are not recycled after a failed attempt | Preserve identity semantics; do not tune from gaps alone |
+| Bounded `index_distribution` sample, lookup work and the reported skew for one HASH index | Inspect key skew and consider an index-specific rehash/rebuild only under its normal gates | More buckets/pages and rebuild work may add storage and write cost; a hot key cannot be made uniformly distributed by a universal bucket count | Keep, adjust locally, or open a separate measured design/spec |
+| Checkpoint lag/WAL bytes, reader ages, writer latency and foreign-participant visibility | Test a local `checkpoint_interval_records`/explicit checkpoint cadence if lag is operationally costly | A checkpoint is an actual publication/barrier operation, not a substitute for a commit. Retained readers may cap recycling; external writer files must remain visible at the supported adoption boundary | Compare paired latency, WAL and read-visibility results before adjusting |
+
+Keep `maintenance.bloat()` read-only during diagnosis. If physical reclamation is
+needed, use the separate quiescent vacuum contract above; an eligible version
+does **not** mean `vacuum_safe`. Do not run destructive maintenance merely to
+improve a diagnostic number. For each proposed tuning change, preserve a control
+with the same dataset, workload and correctness checks, record raw samples and
+resource costs, then make a scoped decision. A failed or ambiguous campaign means
+retain the existing setting and investigate separately. See the
+[measurement protocol](PERFORMANCE.md#rf12-capacity-decision-protocol).
+
 WAL page-image compression is a separate explicit, one-way activation:
 
 ```python
@@ -346,3 +420,47 @@ benefit heaps with no eligible overflow pages. Physical backup preserves allocat
 metadata; logical transfer uses a fresh heap. See [format and failure boundaries](specs/HEAP_FREE_PAGE_INDEX.md).
 
 ---
+
+## Read snapshot lifetime and diagnosis
+
+Choose transaction scope by consistency requirements using the
+[RF10 reading recipes](PERFORMANCE.md#rf10-reading-recipes-choose-the-snapshot-contract).
+Close owned cursors on partial consumption, errors and cancellation; prefer a
+context manager. Materialized query rows no longer own an active snapshot.
+Do not hold a cursor or read transaction across network/user waits merely to
+reuse it for an unrelated request.
+
+`db.transactions.open_transactions` reports active transactions on this handle,
+including a cursor-owned read transaction. Record its value before opening and
+after closing an owned operation; unrelated legitimate transactions can remain.
+It is not a global reader count. The manager's standing participant registration
+can survive individual transactions and belongs to the handle. Zero active
+transactions therefore does not require zero physical pins. `db.close()` releases
+that handle's participant; it cannot release another handle's ownership.
+
+```python
+before = db.transactions.open_transactions
+with db.query("RETURN 1").cursor(batch_size=1) as rows:
+    row = rows.fetchone()
+after = db.transactions.open_transactions
+status = db.maintenance.status()
+# Compare before/after in an exclusively owned handle, not during concurrent use.
+```
+
+`status.wal_bytes` and `status.checkpoint_lag_lsn` are last-observed diagnostics,
+not a globally atomic view. `status.oldest_reader_age` is currently unavailable
+(`None`); never display it as zero. For an operator-requested, potentially costly
+read-only census, `db.maintenance.bloat()` reports `recyclable_horizon_lsn` and
+ended-version retention. It does not authorize reclamation.
+
+Track the age of application-owned operations with a monotonic clock and an
+explicit application warning threshold. Warn and identify the owner when that
+threshold is exceeded; do not kill a legitimate reader, infer abandonment from
+TTL, or advance a horizon artificially. No new timeout, vacuum policy, automatic
+reader termination or default is introduced by this recipe. RF12 owns the
+separate retention/maintenance measurements.
+
+When a consumer raises or cancellation is reported, preserve that primary
+exception while the context manager attempts cleanup. Secondary cleanup failures
+can be attached as exception notes. Do not replace the primary failure with a
+generic cleanup error or silently claim successful cleanup if close itself fails.

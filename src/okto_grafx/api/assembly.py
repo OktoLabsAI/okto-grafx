@@ -111,6 +111,7 @@ from okto_grafx.runtime.config import (
 from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
 from okto_grafx.runtime.capability_probe import port_has_attribute
 from okto_grafx.runtime.scoped_value import ContextLocalValue
+from okto_grafx.engine.statement_work import StatementWorkScope
 from okto_grafx.runtime.tuple_encoding_proofs import new_tuple_encoding_proofs
 
 __all__ = [
@@ -389,6 +390,7 @@ def assemble_database(
         catalog = CatalogStore(pool)
         tuple_encoding_proofs = new_tuple_encoding_proofs()
         heap = HeapStore(pool, catalog, tuple_encoding_proofs=tuple_encoding_proofs)
+        heap._statement_work = StatementWorkScope(ContextLocalValue("okto_grafx_statement_work"))
         indexes = IndexManager(
             pool,
             heap,

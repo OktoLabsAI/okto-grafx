@@ -616,7 +616,12 @@ def _outcome(database: object, probes: object) -> tuple:
         result = database.execute(QUERY, {"node_ids": probes})  # type: ignore[attr-defined]
     except GrafxError as failure:
         return ("erro", type(failure).__name__, repr(sorted(failure.to_dict().items())))
-    return ("linhas", tuple(sorted(result.rows)), tuple(sorted(result.statistics.items())))
+    # The injected missing capability and unsupported probe deliberately select
+    # distinct fallbacks. Keep every work counter (including zero heap work),
+    # excluding only those two known diagnostic causes from this comparison.
+    statistics = {name: value for name, value in result.statistics.items()
+                  if name not in {"fallback_reason_index_unavailable", "fallback_reason_unproven_totality"}}
+    return ("linhas", tuple(sorted(result.rows)), tuple(sorted(statistics.items())))
 
 
 def test_a_table_that_never_allocated_a_relationship_answers_empty_without_opening_anything(

@@ -28,6 +28,7 @@ from okto_grafx.engine import query_engine as qe
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager, IndexStore
 from okto_grafx.errors import GrafxCorruptionDetected
+from .work_statistics import comparable_statistics
 
 PREFIX = "MATCH (a:A)-[r:E]->(b:B) WHERE a.id='a' "
 QUERY = PREFIX + "RETURN b.id, b.title, count(r) ORDER BY b.id"
@@ -254,7 +255,7 @@ def test_batched_rows_order_columns_and_statistics_equal_the_scalar_path(
     scalar = graph.execute(PREFIX + suffix)
     assert candidate.rows == scalar.rows
     assert candidate.columns == scalar.columns
-    assert candidate.statistics == scalar.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(scalar.statistics)
 
 
 @pytest.mark.parametrize("suffix", ["RETURN b.id LIMIT 1", "RETURN b.id",
@@ -284,7 +285,7 @@ def test_vector_landing_with_the_closed_proof_still_batches(vector_graph, monkey
 def test_runtime_landing_table_is_reproved_before_any_batch(graph, monkeypatch):
     """A plan-level verdict never admits a batch on a table that stores a vector."""
     original = qe._declares_vector
-    monkeypatch.setattr(qe, "_total_landings", lambda engine, node: True)
+    monkeypatch.setattr(qe, "_total_landings", lambda engine, node, reasons=None: True)
     monkeypatch.setattr(qe, "_declares_vector",
                         lambda table: True if table.name == "B" else original(table))
     counts, _keys = _port(monkeypatch)
@@ -386,7 +387,7 @@ def test_wide_fan_out_refills_the_frontier_and_returns_the_scalar_rows(
     assert counts["versions"] == WIDE_DESTINATIONS  # one page-0 certificate per landing
     assert candidate.rows == scalar.rows
     assert candidate.columns == scalar.columns
-    assert candidate.statistics == scalar.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(scalar.statistics)
     assert candidate.rows == tuple(
         (identifier, f"Title {index:03d}") for index, identifier in enumerate(WIDE_IDS))
 
@@ -408,7 +409,7 @@ def test_wide_fan_out_shapes_equal_the_scalar_path(
     assert counts["versions"] == WIDE_DESTINATIONS
     assert candidate.rows == scalar.rows
     assert candidate.columns == scalar.columns
-    assert candidate.statistics == scalar.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(scalar.statistics)
 
 
 def test_a_refusal_on_the_last_refill_turn_matches_the_scalar_refusal(
@@ -463,7 +464,7 @@ def test_invisible_destinations_are_batched_validated_and_dropped(wide_graph, mo
     assert counts["versions"] == WIDE_DESTINATIONS and set(seen) == set(WIDE_HIDDEN)
     assert candidate.rows == scalar.rows
     assert candidate.columns == scalar.columns
-    assert candidate.statistics == scalar.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(scalar.statistics)
     assert candidate.rows == tuple(
         (identifier, f"Title {index:03d}")
         for index, identifier in enumerate(WIDE_IDS) if identifier not in WIDE_HIDDEN)
@@ -497,7 +498,7 @@ def test_overlapping_destinations_batch_once_per_source_not_once_per_64(
     assert counts["versions"] == OVERLAP_DESTINATIONS - 1
     assert candidate.rows == scalar.rows
     assert candidate.columns == scalar.columns
-    assert candidate.statistics == scalar.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(scalar.statistics)
     assert len(candidate.rows) == OVERLAP_DESTINATIONS - 1
 
 
@@ -514,5 +515,5 @@ def test_overlapping_destinations_keep_every_row_and_its_order(
     assert counts["versions"] == OVERLAP_DESTINATIONS - 1
     assert candidate.rows == scalar.rows
     assert candidate.columns == scalar.columns
-    assert candidate.statistics == scalar.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(scalar.statistics)
     assert len(candidate.rows) == OVERLAP_SOURCES * OVERLAP_FANOUT

@@ -218,6 +218,42 @@ the capacity, but import/rebuild computes destination-generation statistics rath
 than copying source historical markers. Malformed/missing/future/nonmonotonic
 metadata refuses; it is not silently converted to an empty history or fallback.
 
+### Choosing and checking a statistics source
+
+Choose the index mode for a measured workload, then inspect
+`TextSearchResult.statistics_regime` for **each reader snapshot**. This field
+describes how the corpus totals were obtained; it does not change the query's
+postings, result limit, BM25 formula or visibility rules.
+
+| Observed regime | Coverage and interpretation | Decision boundary |
+| --- | --- | --- |
+| Result `snapshot_cache` | Reuse of totals for the same snapshot in this participant | A warm-cache observation is not evidence for a cold or reopened search. |
+| Result `wal_delta` | Exact totals reconstructed from the available WAL reductions | Count the WAL work and history retained; this is not a persisted summary for every snapshot. |
+| Result `durable_summary` | Persisted scalar or bounded-history reduction proves coverage of this snapshot | Eligible cuts can avoid a full corpus-statistics census; posting and candidate work remain. |
+| Result `full_census` | Exact snapshot corpus walk when no proved summary/delta covers the reader | Valid fallback, including an older reader outside the retained window; budget and latency costs still apply. |
+
+For a same-workload comparison, build separate `wal` and `durable` indexes over
+the same fields, analyzer, weights and corpus. Use the **same explicit read
+transaction** for paired searches and compare record IDs, scores, tie ordering
+and `corpus_documents` against an independent exact census. Test a
+newly opened handle before its first search, a repeated same-snapshot search,
+and a reopen after a complete commit/checkpoint. Keep application cache and OS
+filesystem cache observations distinct: a new Grafx handle does not flush the OS
+cache. Record `statistics_regime`, `postings_visited` and census work rather than
+inferring a source from elapsed time alone.
+
+For retained-reader workloads, sample history capacities 0 through 32 only where
+the page-size check accepts them. Include a reader before the summary, one inside
+the retained interval, and one after later complete commits have evicted a marker.
+An uncovered snapshot must use an exact WAL/census route. Malformed or
+wrong-identity summary metadata must refuse; corruption is never a cache miss to
+hide. Compare write ACK latency, WAL bytes, page-0 rewrite work, verification and
+disk space as well as read cost. Keep `wal` when warm search already meets the
+workload or compatibility/write cost dominates; choose durable only when its
+measured cold/reopen benefit justifies the capability and write cost. Neither
+choice changes the project default. See the
+[RF11 measurement matrix](PERFORMANCE.md#rf11-full-text-statistics-matrix).
+
 ## Procedure query
 
 Materialized `Database.execute` and read `Transaction.execute` also accept:
