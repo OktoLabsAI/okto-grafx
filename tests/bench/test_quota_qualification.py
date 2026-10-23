@@ -88,6 +88,79 @@ def test_real_batches_and_multiplicity(tmp_path, count):
         assert result.statistics.get("certificate_retries", 0) == 0
 
 
+@pytest.mark.parametrize("field", quota.FIELDS)
+def test_128_landings_reduce_real_certificate_work_with_same_quota_and_fixture(
+    tmp_path, monkeypatch, field,
+):
+    cases = quota.qualification_matrix(Scenario)
+    target, control = next(
+        (target, control)
+        for target, control in zip(cases[::2], cases[1::2])
+        if target.quota_field == field
+    )
+    assert query_for(target) == query_for(control)
+    root = tmp_path / "db"
+    prepare(root, target)
+    query, params = query_for(target)
+    expected = oracle(target)
+    assert len(expected) == 128
+
+    with okto_grafx.connect(root, **quota.connection_options(target)) as db:
+        assert getattr(db._queries, "_" + field) == 128
+        batched = db.execute(query, params)
+        with monkeypatch.context() as patch:
+            patch.setattr(qe, "_admits_batched_landings", lambda *_: False)
+            scalar = db.execute(query, params)
+
+        assert batched.rows == scalar.rows == expected
+        assert comparable_statistics(batched.statistics) == comparable_statistics(scalar.statistics)
+        assert batched.statistics["landing_batches"] == 2
+        assert scalar.statistics.get("landing_batches", 0) == 0
+        assert batched.statistics["landing_candidates"] == scalar.statistics["landing_candidates"] == 128
+        assert batched.statistics["certificate_attempts"] < scalar.statistics["certificate_attempts"]
+        assert batched.statistics.get("certificate_retries", 0) == 0
+        assert scalar.statistics.get("certificate_retries", 0) == 0
+        assert db._queries._owner_budget._used_bytes == 0
+
+    # The same persisted topology and traversal quota remain in force when a
+    # logical memory budget selects the scalar path. This is the independent
+    # memory guard, not a claim of a measured peak for the unbudgeted batch.
+    with okto_grafx.connect(root, query_memory_budget_bytes=control.query_memory_budget_bytes,
+                            **quota.connection_options(control)) as db:
+        assert getattr(db._queries, "_" + field) == 128
+        guarded = measure_statement(db, control, 0)
+        assert guarded["rows"] == len(expected)
+        assert guarded["result_hash"] == guarded["expected_result_hash"]
+        assert guarded["statistics"]["landing_candidates"] == 128
+        assert guarded["statistics"].get("landing_batches", 0) == 0
+        assert guarded["statistics"]["fallback_reason_memory_guard"] == 1
+        assert guarded["statistics"]["certificate_attempts"] == scalar.statistics["certificate_attempts"]
+        assert 0 < guarded["memory"]["logical_memory_peak_bytes"] <= control.query_memory_budget_bytes
+        assert guarded["memory"]["baseline_retained_bytes"] == 0
+        assert guarded["memory"]["coverage"] != "unavailable"
+        assert db._queries._owner_budget._used_bytes == 0
+
+
+def test_128_parallel_edges_keep_row_multiplicity_distinct_from_candidate_work(
+    tmp_path, monkeypatch,
+):
+    scenario = replace(case(128), nodes=32)
+    root = tmp_path / "db"
+    prepare(root, scenario)
+    query, params = query_for(scenario)
+    with okto_grafx.connect(root, **quota.connection_options(scenario)) as db:
+        batched = db.execute(query, params)
+        with monkeypatch.context() as patch:
+            patch.setattr(qe, "_admits_batched_landings", lambda *_: False)
+            scalar = db.execute(query, params)
+        assert batched.rows == scalar.rows == oracle(scenario)
+        assert len(batched.rows) == 128
+        assert len(set(batched.rows)) == 32
+        assert batched.statistics["landing_candidates"] == scalar.statistics["landing_candidates"] == 32
+        assert batched.statistics["certificate_attempts"] < scalar.statistics["certificate_attempts"]
+        assert db._queries._owner_budget._used_bytes == 0
+
+
 def test_worker_refuses_unapplied_quota(tmp_path):
     scenario = case(2)
     root = tmp_path / "db"
