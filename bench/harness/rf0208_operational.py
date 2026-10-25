@@ -206,7 +206,7 @@ def _run(snapshot, partition, expected_manifest_hash):
     runner = canonical_path(manifest["runner_root"])
     baseline = canonical_path(manifest["baseline_root"])
     candidate = canonical_path(manifest["candidate_root"])
-    if canonical_path(manifest["python"]) != canonical_path(sys.executable):
+    if canonical_path(manifest["python"]) != canonical_path(Path(sys.executable).resolve()):
         raise ValueError("interpreter differs from registered runner")
     before = {"runner": inventory(runner, manifest["runner_revision"]),
               "baseline": inventory(baseline, manifest["baseline_revision"]),
@@ -324,7 +324,7 @@ def _run_report(snapshot, expected_manifest_hash):
         raise ValueError("RF04 report manifest changed")
     snapshot = canonical_path(snapshot)
     runner = canonical_path(manifest["runner_root"])
-    if canonical_path(manifest["python"]) != canonical_path(sys.executable):
+    if canonical_path(manifest["python"]) != canonical_path(Path(sys.executable).resolve()):
         raise ValueError("interpreter differs from authenticated report runner")
     runner_before = inventory(runner, manifest["runner_revision"])
     verify_snapshot(snapshot, runner_before)

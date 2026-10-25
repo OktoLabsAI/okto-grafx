@@ -1,9 +1,11 @@
 """Tamper checks for the RF04 non-temporal four-arm certificate."""
 from copy import deepcopy
 import hashlib
+from io import BytesIO
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
+import tarfile
 
 import pytest
 
@@ -87,7 +89,7 @@ def test_recorded_four_arm_evidence_replays_and_keeps_candidate_guard_source():
         encoding="utf-8"))
     assert evaluate(record["observations"], record["report"]["source_isolation"]) == record["report"]
     guard = record["candidate_functional_guards"]
-    blob = subprocess.run(["git", "show", f"{guard['revision']}:{Path(guard['module']).as_posix()}"],
+    blob = subprocess.run(["git", "show", f"{guard['revision']}:{PureWindowsPath(guard['module']).as_posix()}"],
                           cwd=root, check=True, capture_output=True).stdout
     assert hashlib.sha256(blob).hexdigest() == guard["module_blob_sha256"]
     assert guard["revision"] == REVISIONS["both"]
@@ -99,7 +101,25 @@ def test_git_free_bundle_rejects_any_changed_source_blob(tmp_path):
     root = Path(__file__).resolve().parents[2]
     manifest = json.loads((root / "bench/evidence/rf04-source-bundle-1b8e529.json").read_text(
         encoding="utf-8"))
-    arms = materialize_bundle(root, tmp_path, manifest)
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar", REVISIONS["both"], "src/okto_grafx",
+         "bench/harness", "tests/query/test_conditional_endpoint_evidence.py"],
+        cwd=root, check=True, capture_output=True,
+    ).stdout
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as bundle:
+        for member in bundle:
+            if not member.isfile():
+                continue
+            path = Path(member.name)
+            assert not path.is_absolute() and ".." not in path.parts
+            target = snapshot / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = bundle.extractfile(member)
+            assert source is not None
+            target.write_bytes(source.read())
+    arms = materialize_bundle(snapshot, tmp_path, manifest)
     assert all(not (arm / ".git").exists() for arm in arms.values())
     assert source_isolation(arms, manifest)["changed_files"]["rf03_only_to_both"] == [
         "src/okto_grafx/engine/query_engine.py"]

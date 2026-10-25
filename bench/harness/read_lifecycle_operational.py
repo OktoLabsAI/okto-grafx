@@ -141,7 +141,7 @@ def _run(snapshot, expected_manifest_hash):
         raise ValueError("operational manifest changed")
     candidate, baseline = canonical_path(manifest["candidate_root"]), canonical_path(manifest["baseline_root"])
     python = canonical_path(manifest["python"])
-    if python != canonical_path(sys.executable):
+    if python != canonical_path(Path(sys.executable).resolve()):
         raise ValueError("interpreter differs from authenticated runner")
     before = inventory(candidate, manifest["candidate_revision"])
     baseline_before = inventory(baseline, manifest["baseline_revision"])

@@ -44,7 +44,9 @@ def test_real_rf04_target_preserves_rows_and_uses_endpoint_work(tmp_path):
         build_fixture(db, target)
         sample = measure_statement(db, target, 5)
         assert sample["rf04_access"] == access(sample)
-        assert sample["cpu_ns"] > 0 and sample["rss_peak_bytes"] > 0
+        assert sample["elapsed_ns"] > 0 and sample["rss_peak_bytes"] > 0
+        # Windows process_time_ns can round a short query down to zero.
+        assert sample["cpu_ns"] >= 0
         assert "logical_memory_peak_bytes" in sample["memory"]
         for profile in ("with", "original"):
             scenario = next(s for s in rf04_matrix(Scenario) if s.name == f"rf04-{profile}-target")

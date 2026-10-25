@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -18,11 +19,12 @@ from bench.harness.rf0208_operational import (DEFAULT_BUDGET, PARTITIONS, REPORT
 
 def manifest(partition):
     budget = None if partition in ("RF06", "RF08") else DEFAULT_BUDGET
+    root = Path.cwd().resolve()
     return {"schema_version": SCHEMA, "partition": partition,
-            "runner_root": "C:/runner", "runner_revision": "b" * 40,
-            "baseline_root": "C:/baseline", "baseline_revision": "a" * 40,
-            "candidate_root": "C:/candidate", "candidate_revision": "b" * 40,
-            "python": "C:/python.exe", "output": "C:/runs/one",
+            "runner_root": str(root / "runner"), "runner_revision": "b" * 40,
+            "baseline_root": str(root / "baseline"), "baseline_revision": "a" * 40,
+            "candidate_root": str(root / "candidate"), "candidate_revision": "b" * 40,
+            "python": str(Path(sys.executable).resolve()), "output": str(root / "runs" / "one"),
             "timeout_seconds": 3500, "memory_budget_bytes": budget,
             "scenarios": [s.name for s in expected_scenarios(partition, budget)],
             "attempt": 1, "previous_output": None, "previous_campaign_sha256": None}
