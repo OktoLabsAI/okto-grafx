@@ -2,7 +2,7 @@
 
 ## RF01–RF12 implementation evidence
 
-The current development branch includes the RF01–RF12 mechanisms and recipes
+The 0.0.8 development source includes the RF01–RF12 mechanisms and recipes
 summarized in the [roadmap](../ROADMAP.md#grafx-performance-rf01rf12-october-23-2026).
 Their qualification establishes exact results, bounded logical-memory and
 quota behavior, streaming demand, durable ACK/reopen, rollback and structural

@@ -7,6 +7,12 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Version alignment
+
+- Advance the source, package metadata, CLI and installed-wheel checks to 0.0.8
+  after confirming that 0.0.7 was already published on PyPI. This entry does not
+  claim publication of 0.0.8.
+
 ### RF01–RF12 structural performance and consistency round
 
 - Deliver physical-work diagnostics, proven scalar and connected seeks,

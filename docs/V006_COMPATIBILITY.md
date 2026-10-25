@@ -71,7 +71,7 @@ The reproducible command installs both supplied wheels into separate temporary
 targets, invokes isolated interpreters and checks imported package origins:
 
 ```sh
-python tools/check_v006_upgrade.py --legacy-wheel legacy/okto_grafx-0.0.5-py3-none-any.whl --current-wheel current/okto_grafx-0.0.7-py3-none-any.whl
+python tools/check_v006_upgrade.py --legacy-wheel legacy/okto_grafx-0.0.5-py3-none-any.whl --current-wheel current/okto_grafx-0.0.8-py3-none-any.whl
 ```
 
 Install NumPy, google-crc32c and tzdata in the invoking Python environment first. Isolated
